@@ -1,0 +1,8 @@
+# Ignore PyCache files
+*__pycache__*
+
+# Ignore Numpy data files
+*.npy
+
+# Ignore PyTorch model files
+*.pt
