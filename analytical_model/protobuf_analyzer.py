@@ -10,6 +10,7 @@ Based on Protocol Buffers specification: https://protobuf.dev/
 
 import os
 import re
+import math
 import json
 from pathlib import Path
 from typing import Dict, List, Set, Optional, Tuple
@@ -65,6 +66,8 @@ class RuntimeData:
     operation_counts: Dict[str, int]  # Operation type -> count
     total_string_bytes: int
     total_bytes_bytes: int
+    field_string_lengths: Optional[Dict[str, List[int]]] = None  # field_name -> [lengths]
+    field_bytes_lengths: Optional[Dict[str, List[int]]] = None  # field_name -> [lengths]
 
 
 @dataclass
@@ -144,12 +147,13 @@ class ProtobufAnalyzer:
         'enum': 1,
     }
     
-    def __init__(self, proto_file_path: str):
+    def __init__(self, proto_file_path: str, messages_to_analyze: Optional[List[str]] = None):
         self.proto_file_path = proto_file_path
         self.content = self._read_file()
         self.syntax_version = self._extract_syntax()
         self.messages = []
         self.enums = []
+        self.messages_to_analyze = messages_to_analyze  # Only analyze these messages
         # Paths to related files
         self.bench_dir = Path(proto_file_path).parent
         self.inc_file = self.bench_dir / 'benchmark.inc'
@@ -358,7 +362,8 @@ class ProtobufAnalyzer:
         # Parse enums first
         self.enums = self._parse_enums()
         
-        # Parse all top-level messages (handle nested braces properly)
+        # Parse all messages (we need all of them to handle nested messages properly)
+        # We'll filter later when building output
         i = 0
         while i < len(self.content):
             msg_match = re.search(r'message\s+(\w+)', self.content[i:])
@@ -377,7 +382,10 @@ class ProtobufAnalyzer:
             message_content = self.content[msg_start:brace_end + 1]
             message = self._parse_message(message_content, depth=0, all_enums=self.enums)
             if message:
-                self.messages.append(message)
+                # Only add top-level messages to self.messages
+                # Nested messages are already part of their parents
+                if message.depth == 0:
+                    self.messages.append(message)
             
             i = brace_end + 1
         
@@ -480,19 +488,31 @@ class ProtobufAnalyzer:
             string_lengths = []
             bytes_lengths = []
             numeric_values = defaultdict(list)
+            # Map field names to their string/bytes lengths
+            field_string_lengths = defaultdict(list)  # field_name -> [lengths]
+            field_bytes_lengths = defaultdict(list)    # field_name -> [lengths]
             
-            # Extract string literals and their lengths
-            string_pattern = r'set_[a-z0-9]+\(["\']([^"\']+)["\']\)'
+            # Extract string literals and their lengths, mapping to field names
+            # Pattern: set_f<number> or set_<fieldname>(string_value)
+            # Also handle nested: v6->set_f1(...)
+            string_pattern = r'(?:->|\.)?set_([a-z0-9]+)\(["\']([^"\']+)["\']\)'
             for str_match in re.finditer(string_pattern, function_body):
-                string_val = str_match.group(1)
-                string_lengths.append(len(string_val.encode('utf-8')))
+                field_name = str_match.group(1)
+                string_val = str_match.group(2)
+                str_len = len(string_val.encode('utf-8'))
+                string_lengths.append(str_len)
+                field_string_lengths[field_name].append(str_len)
             
             # Extract bytes (they're also strings in the code)
             # Look for set_f calls with long strings (likely bytes)
-            bytes_pattern = r'set_f\d+\(["\']([^"\']{50,})["\']\)'  # Strings > 50 chars likely bytes
+            # Pattern: set_f<number>("very long string...")
+            bytes_pattern = r'(?:->|\.)?set_(f\d+)\(["\']([^"\']{50,})["\']\)'  # Strings > 50 chars likely bytes
             for bytes_match in re.finditer(bytes_pattern, function_body):
-                bytes_val = bytes_match.group(1)
-                bytes_lengths.append(len(bytes_val.encode('utf-8')))
+                field_name = bytes_match.group(1)
+                bytes_val = bytes_match.group(2)
+                bytes_len = len(bytes_val.encode('utf-8'))
+                bytes_lengths.append(bytes_len)
+                field_bytes_lengths[field_name].append(bytes_len)
             
             # Extract numeric values
             numeric_pattern = r'set_[a-z0-9]+\(([0-9xU\.]+)\)'
@@ -527,7 +547,9 @@ class ProtobufAnalyzer:
                 numeric_values=dict(numeric_values),
                 operation_counts=operation_counts,
                 total_string_bytes=sum(string_lengths),
-                total_bytes_bytes=sum(bytes_lengths)
+                total_bytes_bytes=sum(bytes_lengths),
+                field_string_lengths=dict(field_string_lengths) if field_string_lengths else None,
+                field_bytes_lengths=dict(field_bytes_lengths) if field_bytes_lengths else None
             )
         
         return runtime_data if runtime_data else None
@@ -670,16 +692,251 @@ class ProtobufAnalyzer:
         return operations
 
 
+def extract_messages_from_benchmark_iteration(inc_file_path: str) -> Set[str]:
+    """Extract message names that are serialized/deserialized in BenchmarkIteration"""
+    if not Path(inc_file_path).exists():
+        return set()
+    
+    try:
+        with open(inc_file_path, 'r') as f:
+            content = f.read()
+    except Exception:
+        return set()
+    
+    # Find BenchmarkIteration function
+    bench_iter_match = re.search(r'inline\s+int\s+BenchmarkIteration', content)
+    if not bench_iter_match:
+        return set()
+    
+    # Find the function body
+    start_pos = bench_iter_match.end()
+    brace_start = content.find('{', start_pos)
+    if brace_start == -1:
+        return set()
+    
+    # Find matching closing brace
+    depth = 0
+    brace_end = brace_start
+    for i in range(brace_start, len(content)):
+        if content[i] == '{':
+            depth += 1
+        elif content[i] == '}':
+            depth -= 1
+            if depth == 0:
+                brace_end = i
+                break
+    
+    function_body = content[brace_start + 1:brace_end]
+    
+    # Extract messages that are serialized/deserialized
+    messages = set()
+    
+    # Find all _Serialize_F1 and _Deserialize_F1 calls
+    serialize_pattern = r'(\w+)_Serialize_F1'
+    deserialize_pattern = r'(\w+)_Deserialize_F1'
+    
+    for match in re.finditer(serialize_pattern, function_body):
+        messages.add(match.group(1))
+    
+    for match in re.finditer(deserialize_pattern, function_body):
+        messages.add(match.group(1))
+    
+    return messages
+
+
+def find_nested_message_by_path(root_message: Message, message_path: List[str]) -> Optional[Message]:
+    """Find a nested message by following a path like ['M15', 'M17', 'M18']
+    
+    The path represents the type hierarchy. If root_message is M15, then:
+    - ['M15', 'M17', 'M18'] means: find M17 in M15, then find M18 in M17
+    """
+    current = root_message
+    
+    # If the first element matches root, skip it
+    start_idx = 1 if message_path and message_path[0] == root_message.name else 0
+    
+    for msg_name in message_path[start_idx:]:
+        # Find nested message in current message
+        found = None
+        for nested in current.nested_messages:
+            if nested.name == msg_name:
+                found = nested
+                break
+        if found:
+            current = found
+        else:
+            return None
+    return current
+
+
+def calculate_serialized_size_from_set_function(msg_name: str, set_function_body: str, message: Message, all_messages: Dict[str, Message]) -> int:
+    """Update estimated_size_bytes for LENGTH_DELIMITED fields and return total serialized size
+    
+    Processes Set_F1 function line-by-line for efficiency:
+    1. Track nested message variable assignments (e.g., M15::M17::M18* v11 = v9->mutable_f1();)
+    2. Process set operations to calculate sizes for LENGTH_DELIMITED fields
+    3. Update field.estimated_size_bytes directly in the message structure
+    4. Return total serialized size for the message
+    """
+    total_size = 0
+    
+    # Track variable assignments: var_name -> (message_path_list, target_message_name)
+    # Example: v11 -> (['M15', 'M17', 'M18'], 'M18')
+    var_to_message = {}  # var_name -> (message_path_list, target_msg_name)
+    
+    # Pattern: M15::M17::M18* v11 = v9->mutable_f1();
+    mutable_pattern = r'(\w+(?:::\w+)*)\*\s+(\w+)\s*=\s*(\w+)->mutable_(\w+)\(\)'
+    
+    # Pattern: var->set_field(...)
+    set_pattern = r'(\w+)->set_([a-z0-9]+)\('
+    
+    # Process function body line by line
+    lines = set_function_body.split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Check if line contains "=" - could be a mutable assignment
+        if '=' in line:
+            match = re.search(mutable_pattern, line)
+            if match:
+                full_msg_path = match.group(1)  # e.g., "M15::M17::M18"
+                var_name = match.group(2)  # e.g., "v11"
+                
+                # Split the full path into message names
+                message_path = full_msg_path.split('::')
+                target_msg_name = message_path[-1]  # e.g., "M18"
+                var_to_message[var_name] = (message_path, target_msg_name)
+        
+        # Check if line is a set operation
+        match = re.search(set_pattern, line)
+        if match:
+            var_name = match.group(1)  # e.g., "message" or "v11"
+            field_name = match.group(2)  # e.g., "f1"
+            
+            # Check if the value starts with a quote (string/bytes)
+            # match.end() is position after the opening '('
+            value_start = match.end()
+            if value_start < len(line):
+                first_char = line[value_start]
+                
+                if first_char == '"' or first_char == "'":
+                    # String/bytes value - calculate size from line length
+                    # Line format: var->set_field("...");
+                    # String content is between the opening quote and the ");" suffix
+                    # match.end() is after '(', so first_char is the opening quote
+                    # String starts after the quote, ends before ");"
+                    # So: str_len = total_line_length - (position_after_opening_quote) - 3
+                    line_len = len(line)
+                    str_len = line_len - (value_start + 1) - 3  # +1 to skip opening quote, -3 for ");"
+                    
+                    # Find which message and field this refers to
+                    target_field = None
+                    
+                    if var_name == "message":
+                        # Top-level message
+                        target_field = next((f for f in message.fields if f.name == field_name), None)
+                    elif var_name in var_to_message:
+                        # Nested message - navigate to the target message
+                        msg_path, target_msg_name = var_to_message[var_name]
+                        # Find the nested message by following the path from root message
+                        nested_msg = find_nested_message_by_path(message, msg_path)
+                        if nested_msg:
+                            target_field = next((f for f in nested_msg.fields if f.name == field_name), None)
+                    
+                    # Update estimated_size_bytes for LENGTH_DELIMITED fields
+                    if target_field and target_field.wire_type == 'LENGTH_DELIMITED':
+                        if target_field.field_type == 'string' or target_field.field_type == 'bytes':
+                            # Calculate size: tag + length_prefix + string_length
+                            tag_size = 1 if target_field.field_number < 16 else 2
+                            length_prefix = math.ceil(math.log(str_len + 1, 128)) if str_len > 0 else 1
+                            field_size = tag_size + length_prefix + str_len
+                            target_field.estimated_size_bytes = field_size
+    
+    # Calculate total size from all fields (using updated estimated_size_bytes where available)
+    for field in message.fields:
+        tag_size = 1 if field.field_number < 16 else 2
+        
+        if field.wire_type == 'VARINT':
+            total_size += tag_size + 5  # Max varint size
+        elif field.wire_type == 'FIXED32':
+            total_size += tag_size + 4
+        elif field.wire_type == 'FIXED64':
+            total_size += tag_size + 8
+        elif field.wire_type == 'LENGTH_DELIMITED':
+            if field.estimated_size_bytes is not None:
+                total_size += field.estimated_size_bytes
+    
+    return total_size
+
+# Print detailed field and size information for each message recursively
+def print_message_details(msg: Message, indent: int = 0):
+    prefix = "  " * indent
+    print(f"{prefix}Message: {msg.name} (depth: {msg.depth})")
+    
+    # Print message-level info
+    print(f"{prefix}  Fields ({len(msg.fields)}):")
+    for field in msg.fields:
+        field_info = f"{prefix}    {field.name} (#{field.field_number}): {field.cardinality} {field.field_type}"
+        if field.wire_type:
+            field_info += f" [wire: {field.wire_type}]"
+        if field.estimated_size_bytes is not None:
+            field_info += f" [size: {field.estimated_size_bytes} bytes]"
+        if field.is_nested_message and field.nested_message_name:
+            field_info += f" -> {field.nested_message_name}"
+        if field.is_enum and field.enum_name:
+            field_info += f" -> enum {field.enum_name}"
+        print(field_info)
+    
+    # Print nested messages recursively
+    if msg.nested_messages:
+        print(f"{prefix}  Nested messages ({len(msg.nested_messages)}):")
+        for nested_msg in msg.nested_messages:
+            print_message_details(nested_msg, indent + 2)
+    
+    # Print enums if any
+    if msg.enums:
+        print(f"{prefix}  Enums ({len(msg.enums)}):")
+        for enum in msg.enums:
+            print(f"{prefix}    {enum.get('name', 'Unknown')} with {len(enum.get('values', []))} values")
+
+
 def analyze_hyperprotobench(base_path: str) -> Dict:
     """Analyze all benchmarks in HyperProtoBench directory"""
     base_path = Path(base_path)
     results = {}
     
-    # Find all benchmark directories
+    # Find all benchmark directories, prioritizing -ser and -deser versions
+    bench_dirs = []
+    basic_bench_dirs = []
+    
     for bench_dir in sorted(base_path.glob('bench*')):
         if not bench_dir.is_dir():
             continue
         
+        # Check if it's a -ser or -deser version
+        if bench_dir.name.endswith('-ser') or bench_dir.name.endswith('-deser'):
+            bench_dirs.append(bench_dir)
+        else:
+            # Store basic benchmarks separately (will be skipped if -ser/-deser exist)
+            basic_bench_dirs.append(bench_dir)
+    
+    # Add basic benchmarks only if their -ser/-deser versions don't exist
+    for basic_dir in basic_bench_dirs:
+        base_name = basic_dir.name
+        has_ser = any(d.name == f"{base_name}-ser" for d in bench_dirs)
+        has_deser = any(d.name == f"{base_name}-deser" for d in bench_dirs)
+        
+        # Only add basic benchmark if neither -ser nor -deser exists
+        if not has_ser and not has_deser:
+            bench_dirs.append(basic_dir)
+    
+    # Sort to process -ser and -deser versions
+    bench_dirs.sort(key=lambda x: (x.name.replace('-ser', '').replace('-deser', ''), x.name))
+    
+    for bench_dir in bench_dirs:
         proto_file = bench_dir / 'benchmark.proto'
         if not proto_file.exists():
             print(f"Warning: {proto_file} not found, skipping {bench_dir.name}")
@@ -687,48 +944,98 @@ def analyze_hyperprotobench(base_path: str) -> Dict:
         
         print(f"Analyzing {bench_dir.name}...")
         try:
-            analyzer = ProtobufAnalyzer(str(proto_file))
+            # First, extract which messages are actually used from BenchmarkIteration
+            inc_file = bench_dir / 'benchmark.inc'
+            print(f"  Extracting messages used from {inc_file}")
+            messages_used = extract_messages_from_benchmark_iteration(str(inc_file))
+            
+            if not messages_used:
+                print(f"  Warning: No messages found in BenchmarkIteration for {bench_dir.name}")
+                continue
+            
+            print(f"  Found {len(messages_used)} messages: {', '.join(sorted(messages_used))}")
+            
+            # Now analyze only those messages
+            analyzer = ProtobufAnalyzer(str(proto_file), messages_to_analyze=list(messages_used))
+            print(f"  Initialized ProtobufAnalyzer for {bench_dir.name}")
             analysis = analyzer.analyze()
             
-            # Convert to serializable format
+            # Extract Set_F1 function bodies and calculate actual sizes
+            if not inc_file.exists():
+                print(f"  Warning: {inc_file} not found")
+                continue
+            
+            with open(inc_file, 'r') as f:
+                inc_content = f.read()
+
+            # Build map of all messages (including nested) for size calculation
+            all_messages_map = {}
+            def add_to_map(msg: Message):
+                all_messages_map[msg.name] = msg
+                for nested in msg.nested_messages:
+                    add_to_map(nested)
+            
+            for msg in analysis.messages:
+                add_to_map(msg)
+            
+            # Extract Set_F1 functions and calculate sizes
+            message_sizes = {}
+            set_pattern = r'int\s+(\w+)_Set_F1[^{]*\{'
+            
+            i = 0
+            while i < len(inc_content):
+                match = re.search(set_pattern, inc_content[i:])
+                if not match:
+                    break
+                
+                start_pos = i + match.end() - 1
+                msg_name = match.group(1)
+                
+                if msg_name not in messages_used:
+                    i = start_pos + 1
+                    continue
+                
+                # Find matching closing brace
+                brace_end = analyzer._find_matching_brace(inc_content, start_pos)
+                if brace_end == -1:
+                    i = start_pos + 1
+                    continue
+                
+                function_body = inc_content[start_pos + 1:brace_end]
+                i = brace_end + 1
+                
+                # Find the message in our analysis
+                msg_obj = None
+                for msg in analysis.messages:
+                    if msg.name == msg_name:
+                        msg_obj = msg
+                        break
+                
+                if msg_obj:
+                    # Calculate actual serialized size
+                    size = calculate_serialized_size_from_set_function(
+                        msg_name, function_body, msg_obj, all_messages_map
+                    )
+                    message_sizes[msg_name] = size
+                    # print_message_details(msg_obj)
+
+            print(f"  Finished calculating serialized sizes for {bench_dir.name}")        
+            
+            # Convert to serializable format - only include used messages
             results[bench_dir.name] = {
                 'benchmark_name': analysis.benchmark_name,
                 'proto_file_path': analysis.proto_file_path,
                 'syntax_version': analysis.syntax_version,
-                'statistics': {
-                    'total_messages': analysis.total_messages,
-                    'total_fields': analysis.total_fields,
-                    'max_nesting_depth': analysis.max_nesting_depth,
-                    'repeated_field_count': analysis.repeated_field_count,
-                    'enum_count': analysis.enum_count,
-                    'nested_message_count': analysis.nested_message_count,
-                },
-                'field_type_distribution': analysis.field_type_distribution,
-                'cardinality_distribution': analysis.cardinality_distribution,
-                'wire_type_distribution': analysis.wire_type_distribution,
-                'messages': []
+                'messages_used': sorted(list(messages_used)),
+                'messages': [],
+                'message_sizes_bytes': message_sizes,
+                'total_size_bytes': sum(message_sizes.values())
             }
             
-            # Add runtime configuration if available
-            if analysis.benchmark_config:
-                results[bench_dir.name]['runtime_config'] = {
-                    'working_set_size': analysis.benchmark_config.working_set_size,
-                    'iterations': analysis.benchmark_config.iterations,
-                    'messages_used': analysis.benchmark_config.messages_used,
-                    'messages_used_count': len(analysis.benchmark_config.messages_used)
-                }
             
-            # Add operation statistics if available
-            if analysis.operation_statistics:
-                results[bench_dir.name]['operation_statistics'] = analysis.operation_statistics
-            
-            # Add estimated serialized sizes if available
-            if analysis.estimated_serialized_sizes:
-                results[bench_dir.name]['estimated_serialized_sizes'] = analysis.estimated_serialized_sizes
-                results[bench_dir.name]['total_estimated_bytes'] = sum(analysis.estimated_serialized_sizes.values())
-            
-            # Helper function to recursively add messages
-            def add_message(msg: Message, parent_name: str = None):
+            # Helper function to recursively add messages (only used ones and their nested messages)
+            def add_message(msg: Message, parent_name: str = None, is_used: bool = False):
+                # is_used indicates if this message or an ancestor is in messages_used
                 msg_data = {
                     'name': msg.name,
                     'parent': parent_name,
@@ -738,14 +1045,17 @@ def analyze_hyperprotobench(base_path: str) -> Dict:
                     'has_repeated_fields': msg.has_repeated_fields,
                     'has_nested_messages': msg.has_nested_messages,
                     'has_enums': msg.has_enums,
-                    'estimated_size_bytes': msg.estimated_size_bytes,
                     'nested_message_count': len(msg.nested_messages),
                     'fields': [],
                     'nested_messages': []
                 }
                 
+                # Add size if available (only for top-level used messages)
+                if msg.name in message_sizes:
+                    msg_data['serialized_size_bytes'] = message_sizes[msg.name]
+                
                 for field in msg.fields:
-                    msg_data['fields'].append({
+                    field_data = {
                         'name': field.name,
                         'field_number': field.field_number,
                         'field_type': field.field_type,
@@ -755,46 +1065,36 @@ def analyze_hyperprotobench(base_path: str) -> Dict:
                         'nested_message_name': field.nested_message_name,
                         'is_enum': field.is_enum,
                         'enum_name': field.enum_name,
-                        'estimated_size_bytes': field.estimated_size_bytes,
-                    })
-                
-                # Recursively add nested messages
-                for nested_msg in msg.nested_messages:
-                    nested_data = add_message(nested_msg, msg.name)
-                    msg_data['nested_messages'].append(nested_data['name'])
-                    results[bench_dir.name]['messages'].append(nested_data)
-                
-                # Add runtime data if available
-                if analysis.runtime_data and msg.name in analysis.runtime_data:
-                    rt_data = analysis.runtime_data[msg.name]
-                    msg_data['runtime_data'] = {
-                        'total_string_bytes': rt_data.total_string_bytes,
-                        'total_bytes_bytes': rt_data.total_bytes_bytes,
-                        'string_count': len(rt_data.string_lengths),
-                        'bytes_count': len(rt_data.bytes_lengths),
-                        'avg_string_length': sum(rt_data.string_lengths) / len(rt_data.string_lengths) if rt_data.string_lengths else 0,
-                        'avg_bytes_length': sum(rt_data.bytes_lengths) / len(rt_data.bytes_lengths) if rt_data.bytes_lengths else 0,
-                        'max_string_length': max(rt_data.string_lengths) if rt_data.string_lengths else 0,
-                        'max_bytes_length': max(rt_data.bytes_lengths) if rt_data.bytes_lengths else 0,
-                        'operation_counts': rt_data.operation_counts
                     }
+                    
+                    # Add estimated size for LENGTH_DELIMITED fields
+                    if field.wire_type == 'LENGTH_DELIMITED' and field.estimated_size_bytes is not None:
+                        field_data['estimated_size_bytes'] = field.estimated_size_bytes
+                    
+                    msg_data['fields'].append(field_data)
                 
-                # Add estimated serialized size if available
-                if analysis.estimated_serialized_sizes and msg.name in analysis.estimated_serialized_sizes:
-                    msg_data['estimated_serialized_size_bytes'] = analysis.estimated_serialized_sizes[msg.name]
+                # Recursively add nested messages (they're part of the serialized data)
+                for nested_msg in msg.nested_messages:
+                    nested_data = add_message(nested_msg, msg.name, is_used=True)
+                    msg_data['nested_messages'].append(nested_data['name'])
+                    # Add nested messages to the list
+                    results[bench_dir.name]['messages'].append(nested_data)
                 
                 return msg_data
             
-            # Add all messages (top-level and nested)
+            # Add only used messages (and their nested messages will be added recursively)
             for msg in analysis.messages:
-                msg_data = add_message(msg)
-                results[bench_dir.name]['messages'].append(msg_data)
+                if msg.name in messages_used:
+                    msg_data = add_message(msg, is_used=True)
+                    results[bench_dir.name]['messages'].append(msg_data)
+            
+            print(f"  Finished analyzing {bench_dir.name}")
             
         except Exception as e:
             print(f"Error analyzing {bench_dir.name}: {e}")
             import traceback
             traceback.print_exc()
-    
+
     return results
 
 
@@ -897,6 +1197,10 @@ def save_json_report(results: Dict, output_path: str):
     print(f"\nDetailed analysis saved to: {output_path}")
 
 
+# def extract_ml_features(results: Dict) -> Dict:
+#     """Extract ML features from the benchmark analysis results"""
+    
+
 def main():
     """Main entry point"""
     import argparse
@@ -920,12 +1224,22 @@ def main():
         action='store_true',
         help='Print summary to console'
     )
+    # parser.add_argument(
+    #     '--output-ml-features',
+    #     type=str,
+    #     default='ml_features.json',
+    #     help='Output ML features JSON file path'
+    # )
     
     args = parser.parse_args()
     
-    # Resolve path relative to script location
     script_dir = Path(__file__).parent
-    hyperprotobench_path = script_dir / args.hyperprotobench_path
+    # Resolve path - can be absolute or relative to script location
+    if args.hyperprotobench_path:
+        if Path(args.hyperprotobench_path).is_absolute():
+            hyperprotobench_path = Path(args.hyperprotobench_path)
+        else:
+            hyperprotobench_path = script_dir / args.hyperprotobench_path
     
     if not hyperprotobench_path.exists():
         print(f"Error: HyperProtoBench path not found: {hyperprotobench_path}")
@@ -947,6 +1261,10 @@ def main():
     # Save JSON report
     output_path = script_dir / args.output
     save_json_report(results, str(output_path))
+
+    # # Extract ML features
+    # ml_features = extract_ml_features(results)
+    # save_json_report(ml_features, str(args.output_ml_features))
     
     print(f"\nAnalysis complete! Analyzed {len(results)} benchmarks.")
 
