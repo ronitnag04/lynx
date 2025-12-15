@@ -9,3 +9,6 @@
 
 # Ignore JSON output files in analytical_model
 analytical_model/*.json
+
+# Ignore plots in analytical_model
+analytical_model/plots/
