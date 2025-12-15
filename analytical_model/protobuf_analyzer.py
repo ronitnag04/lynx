@@ -9,6 +9,7 @@ Based on Protocol Buffers specification: https://protobuf.dev/
 """
 
 import os
+import time
 import re
 import math
 import json
@@ -332,7 +333,7 @@ class ProtobufAnalyzer:
                 continue
             
             cardinality = field_match.group(1) or 'optional'
-            field_type = field_match.group(2).strip()
+            original_field_type = field_match.group(2).strip()
             field_name = field_match.group(3)
             field_number = int(field_match.group(4))
             
@@ -343,17 +344,25 @@ class ProtobufAnalyzer:
             
             # Check if field type is a nested message (by name)
             for nested_msg in nested_messages:
-                if field_type == nested_msg.name:
+                if original_field_type == nested_msg.name:
                     is_nested_message = True
                     nested_message_name = nested_msg.name
                     break
             
             # Check if field type is an enum
             for enum in all_enums + enums:
-                if field_type == enum['name']:
+                if original_field_type == enum['name']:
                     is_enum = True
                     enum_name = enum['name']
                     break
+            
+            # Normalize field_type: M[0-9]+ -> 'message', E[0-9]+ -> 'enum'
+            # Keep original for checks above, normalize for storage
+            field_type = original_field_type
+            if re.match(r'^M\d+$', original_field_type):
+                field_type = 'message'
+            elif re.match(r'^E\d+$', original_field_type):
+                field_type = 'enum'
             
             # Determine wire type
             wire_type = self.WIRE_TYPES.get(field_type, 'LEN')
@@ -380,8 +389,8 @@ class ProtobufAnalyzer:
                 size_bytes = tag_size + 8
             elif wire_type == 'VARINT':
                 # VARINT wire type: tag + varint value (1-10 bytes)
-                # For bool and enum, we know the value size is 1 byte (always 0x00 or 0x01)
                 if field_type == 'bool' or is_enum:
+                    # For bool and enum, they are encoded as if they were int32s
                     size_bytes = tag_size + 1
                 else:
                     # Other VARINT types (int32, int64, etc.) - size depends on value, cannot determine from type
@@ -796,94 +805,34 @@ def find_nested_message_by_path(root_message: Message, message_path: List[str]) 
     return current
 
 
-def calculate_nested_message_size(nested_msg: Message, var_name: str, lines: List[str], var_to_message: Dict, all_messages: Dict[str, Message], nested_message_sizes: Dict[str, int], var_to_parent_var: Dict[str, str]) -> int:
-    """Calculate the serialized size of a nested message by processing its set operations"""
-    nested_size = 0
-    
-    # Pattern: var->set_field(...)
-    set_pattern = r'(\w+)->set_([a-z0-9]+)\('
-    
-    # Process all lines that set fields for this nested message
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        
-        match = re.search(set_pattern, line)
-        if match:
-            line_var_name = match.group(1)  # e.g., "v11"
-            field_name = match.group(2)  # e.g., "f1"
-            
-            # Only process lines that set fields for this nested message
-            if line_var_name != var_name:
-                continue
-            
-            # Find the field in the nested message
-            target_field = next((f for f in nested_msg.fields if f.name == field_name), None)
-            if not target_field:
-                continue
-            
-            # Check if the value starts with a quote (string/bytes)
-            value_start = match.end()
-            if value_start < len(line):
-                first_char = line[value_start]
-                
-                if first_char == '"' or first_char == "'":
-                    # String/bytes value - calculate size from line length
-                    line_len = len(line)
-                    str_len = line_len - (value_start + 1) - 3  # +1 to skip opening quote, -3 for ");"
-                    
-                    # Set size for LEN fields from runtime values
-                    # Per Protocol Buffers encoding: LEN = tag + length_varint + payload
-                    if target_field.wire_type == 'LEN':
-                        if target_field.field_type == 'string' or target_field.field_type == 'bytes':
-                            # Calculate size: tag + length_varint + payload
-                            tag_size = ProtobufAnalyzer._calculate_tag_size(target_field.field_number)
-                            length_varint_size = ProtobufAnalyzer._calculate_varint_size(str_len)
-                            field_size = tag_size + length_varint_size + str_len
-                            target_field.size_bytes = field_size
-                # Note: Numeric values are not processed here - their sizes remain None
-                # unless determined from type information during field creation
-    
-    # Calculate total size of nested message from all its fields
-    # Only include fields where size_bytes has been determined from runtime values
-    for field in nested_msg.fields:
-        if field.size_bytes is not None:
-            # Size determined from runtime values
-            nested_size += field.size_bytes
-        elif field.is_nested_message and field.nested_message_name:
-                # Check if we have a pre-calculated size for this nested message
-                # Find the variable that sets this nested message (child of current var_name)
-                nested_var = None
-                for var, (msg_path, target_msg_name, _) in var_to_message.items():
-                    if target_msg_name == field.nested_message_name:
-                        # Check if this variable's parent is our current var_name
-                        if var in var_to_parent_var and var_to_parent_var[var] == var_name:
-                            nested_var = var
-                            break
-                
-                if nested_var and nested_var in nested_message_sizes:
-                    # Use pre-calculated size for nested message
-                    # Per Protocol Buffers encoding: LEN = tag + length_varint + payload
-                    nested_nested_size = nested_message_sizes[nested_var]
-                    tag_size = ProtobufAnalyzer._calculate_tag_size(field.field_number)
-                    length_varint_size = ProtobufAnalyzer._calculate_varint_size(nested_nested_size)
-                    field_total_size = tag_size + length_varint_size + nested_nested_size
-                    nested_size += field_total_size
-                    field.size_bytes = field_total_size
-    
-    return nested_size
+def get_message_for_var(var_name: str, var_to_message: Dict, message: Message, all_messages: Dict[str, Message]) -> Optional[Message]:
+    """Get the message object for a given variable name"""
+    if var_name == "message":
+        return message
+    elif var_name in var_to_message:
+        msg_path, target_msg_name, _ = var_to_message[var_name]
+        # Try to find from message structure first
+        nested_msg = find_nested_message_by_path(message, msg_path)
+        if nested_msg:
+            return nested_msg
+        # Fall back to all_messages dict
+        if target_msg_name in all_messages:
+            return all_messages[target_msg_name]
+    return None
 
 
-def calculate_serialized_size_from_set_function(msg_name: str, set_function_body: str, message: Message, all_messages: Dict[str, Message]) -> int:
+def calculate_serialized_size_from_set_function(msg_name: str, set_function_body: str, message: Message, all_messages: Dict[str, Message]) -> Tuple[int, Dict[str, int]]:
     """Calculate serialized size from runtime Set_F1 function and update field sizes
     
-    Processes Set_F1 function line-by-line:
+    Processes Set_F1 function line-by-line in a single pass:
     1. Track nested message variable assignments (e.g., M15::M17::M18* v11 = v9->mutable_f1();)
-    2. Process set operations to determine sizes for variable-size fields from runtime values
-    3. Calculate nested message sizes recursively
-    4. Update field.size_bytes directly in the message structure
-    5. Return total serialized size for the message (including nested messages)
+    2. Process set/add operations to determine sizes for variable-size fields from runtime values
+    3. Update field.size_bytes directly in the message structure (for both top-level and nested messages)
+    4. After processing, calculate nested message sizes and update parent field sizes
+    5. Return total serialized size for the message (including nested messages) and nested message sizes
+    
+    Returns:
+        Tuple of (total_size, nested_message_sizes) where nested_message_sizes maps message names to their sizes
     """
     total_size = 0
     
@@ -891,18 +840,21 @@ def calculate_serialized_size_from_set_function(msg_name: str, set_function_body
     # Example: v11 -> (['M15', 'M17', 'M18'], 'M18', 'f1')
     var_to_message = {}  # var_name -> (message_path_list, target_msg_name, field_name)
     var_to_field = {}  # var_name -> (parent_message, field_name) for tracking which field contains the nested message
-    var_to_parent_var = {}  # child_var_name -> parent_var_name for tracking parent-child relationships
     
     # Pattern: M15::M17::M18* v11 = v9->mutable_f1();
     mutable_pattern = r'(\w+(?:::\w+)*)\*\s+(\w+)\s*=\s*(\w+)->mutable_(\w+)\(\)'
     
-    # Pattern: var->set_field(...)
+    # Pattern: var->set_field(...) or var->add_field(...)
     set_pattern = r'(\w+)->set_([a-z0-9]+)\('
+    add_pattern = r'(\w+)->add_([a-z0-9]+)\('
+    
+    # Track repeated field values: (var_name, field_name) -> list of values
+    repeated_field_values = {}  # (var_name, field_name) -> list of values
     
     # Process function body line by line
     lines = set_function_body.split('\n')
     
-    # First pass: track all mutable assignments and update string/bytes field sizes
+    # Single pass: track mutable assignments and process set/add operations
     for line in lines:
         line = line.strip()
         if not line:
@@ -927,19 +879,45 @@ def calculate_serialized_size_from_set_function(msg_name: str, set_function_body
                     var_to_field[var_name] = (message, field_name)
                 elif parent_var in var_to_message:
                     # Find the parent nested message
-                    parent_path, parent_target, _ = var_to_message[parent_var]
-                    parent_nested_msg = find_nested_message_by_path(message, parent_path)
-                    if parent_nested_msg:
-                        var_to_field[var_name] = (parent_nested_msg, field_name)
-                        var_to_parent_var[var_name] = parent_var
-        
-        # Check if line is a set operation for top-level message or already-tracked nested messages
-        match = re.search(set_pattern, line)
+                    parent_msg = get_message_for_var(parent_var, var_to_message, message, all_messages)
+                    if parent_msg:
+                        var_to_field[var_name] = (parent_msg, field_name)
+            continue
+
+        # Check if line is a set or add operation
+        match = None
+        is_add_operation = False
+        set_add_line = line[:line.find('(')+1]
+        if 'set' in set_add_line:
+            match = re.search(set_pattern, line)
+        elif 'add' in set_add_line:
+            match = re.search(add_pattern, line)
+            is_add_operation = True
+
         if match:
             var_name = match.group(1)  # e.g., "message" or "v11"
             field_name = match.group(2)  # e.g., "f1"
             
-            # Check if the value starts with a quote (string/bytes)
+            # Get the target message (could be top-level or nested)
+            target_msg = get_message_for_var(var_name, var_to_message, message, all_messages)
+            if not target_msg:
+                continue
+            
+            # Find the field in the target message
+            target_field = next((f for f in target_msg.fields if f.name == field_name), None)
+            if not target_field:
+                continue
+            
+            # For repeated fields, track values separately (both set and add operations)
+            if target_field.cardinality == 'repeated':
+                key = (var_name, field_name)
+                if key not in repeated_field_values:
+                    repeated_field_values[key] = []
+                # Store the line for later processing
+                repeated_field_values[key].append(line)
+                continue  # Process repeated fields in a separate pass
+            
+            # Process non-repeated field: calculate size and update directly
             value_start = match.end()
             if value_start < len(line):
                 first_char = line[value_start]
@@ -949,24 +927,9 @@ def calculate_serialized_size_from_set_function(msg_name: str, set_function_body
                     line_len = len(line)
                     str_len = line_len - (value_start + 1) - 3  # +1 to skip opening quote, -3 for ");"
                     
-                    # Find which message and field this refers to
-                    target_field = None
-                    target_msg = None
-                    
-                    if var_name == "message":
-                        # Top-level message
-                        target_msg = message
-                        target_field = next((f for f in message.fields if f.name == field_name), None)
-                    elif var_name in var_to_message:
-                        # Nested message - navigate to the target message
-                        msg_path, target_msg_name, _ = var_to_message[var_name]
-                        target_msg = find_nested_message_by_path(message, msg_path)
-                        if target_msg:
-                            target_field = next((f for f in target_msg.fields if f.name == field_name), None)
-                    
                     # Set size for LEN fields from runtime values
                     # Per Protocol Buffers encoding: LEN = tag + length_varint + payload
-                    if target_field and target_field.wire_type == 'LEN':
+                    if target_field.wire_type == 'LEN':
                         if target_field.field_type == 'string' or target_field.field_type == 'bytes':
                             # Calculate size: tag + length_varint + payload
                             tag_size = ProtobufAnalyzer._calculate_tag_size(target_field.field_number)
@@ -974,14 +937,204 @@ def calculate_serialized_size_from_set_function(msg_name: str, set_function_body
                             field_size = tag_size + length_varint_size + str_len
                             target_field.size_bytes = field_size
 
-    # Second pass: calculate nested message sizes bottom-up (deepest first)
-    # Track which nested messages have been calculated
+                # Check if the value is numeric (VARINT wire type)
+                elif target_field.wire_type == 'VARINT' and target_field.field_type not in ['bool', 'enum']:
+                    # Extract numeric value from the line
+                    # Pattern: set_field(value) or add_field(value);
+                    # Value could be: 123, 0x123, 123U, 123.0, etc.
+                    value_match = re.search(r'(?:set_|add_)\w+\(([^)]+)\)', line)
+                    if value_match:
+                        num_str = value_match.group(1).strip()
+                        try:
+                            # Parse numeric value
+                            if 'U' in num_str or 'u' in num_str:
+                                # Unsigned integer
+                                num_str_clean = num_str.replace('U', '').replace('u', '')
+                                if '0x' in num_str_clean or '0X' in num_str_clean:
+                                    num_val = int(num_str_clean, 16)
+                                else:
+                                    num_val = int(num_str_clean)
+                            elif '0x' in num_str or '0X' in num_str:
+                                # Hex integer
+                                num_val = int(num_str, 16)
+                            elif '.' in num_str:
+                                # Float - for VARINT types this shouldn't happen, but handle it
+                                num_val = int(float(num_str))
+                            else:
+                                # Regular integer
+                                num_val = int(num_str)
+                            
+                            # Handle sint32/sint64 ZigZag encoding
+                            # Per spec: (n << 1) ^ (n >> 31) for sint32, (n << 1) ^ (n >> 63) for sint64
+                            if target_field.field_type in ['sint32', 'sint64']:
+                                if num_val < 0:
+                                    # ZigZag encode negative numbers
+                                    if target_field.field_type == 'sint32':
+                                        encoded_val = (num_val << 1) ^ (num_val >> 31)
+                                    else:  # sint64
+                                        encoded_val = (num_val << 1) ^ (num_val >> 63)
+                                else:
+                                    encoded_val = num_val << 1  # Positive numbers: 2 * p
+                            elif target_field.field_type in ['int32', 'int64']:
+                                # For int32/int64 with negative values, use two's complement
+                                # Convert to unsigned for size calculation
+                                if num_val < 0:
+                                    if target_field.field_type == 'int32':
+                                        # Two's complement of 32-bit negative number
+                                        encoded_val = num_val & 0xFFFFFFFF
+                                    else:  # int64
+                                        # Two's complement of 64-bit negative number
+                                        encoded_val = num_val & 0xFFFFFFFFFFFFFFFF
+                                else:
+                                    encoded_val = num_val
+                            else:
+                                # For uint32, uint64, bool, enum - values are already unsigned/positive
+                                encoded_val = num_val
+                            
+                            # Calculate VARINT size: tag + varint value
+                            tag_size = ProtobufAnalyzer._calculate_tag_size(target_field.field_number)
+                            varint_size = ProtobufAnalyzer._calculate_varint_size(encoded_val)
+                            field_size = tag_size + varint_size
+                            target_field.size_bytes = field_size
+                        except (ValueError, AttributeError):
+                            # If we can't parse the value, leave size_bytes as None
+                            raise ValueError(f"Failed to parse {line}, expected VARINT wire type for {target_field.field_type}")
+
+    # Process repeated fields: accumulate values and calculate sizes
+    for (var_name, field_name), value_lines in repeated_field_values.items():
+        # Get the target message (could be top-level or nested)
+        target_msg = get_message_for_var(var_name, var_to_message, message, all_messages)
+        if not target_msg:
+            continue
+        
+        # Find the field in the target message
+        target_field = next((f for f in target_msg.fields if f.name == field_name), None)
+        if not target_field or target_field.cardinality != 'repeated':
+            continue
+        
+        # Determine if field is packable (primitive numeric types)
+        # Per spec: only repeated fields of primitive numeric types can be packed
+        # These are types that would normally use VARINT, I32, or I64 wire types
+        is_packable = target_field.wire_type in ['VARINT', 'I32', 'I64']
+        # Strings, bytes, and messages are not packable
+        is_packable = is_packable and target_field.field_type not in ['string', 'bytes', 'message']
+        
+        if is_packable:
+            # Packed repeated field: single LEN record with all values concatenated
+            # Size = tag + length_varint + (sum of all element sizes)
+            tag_size = ProtobufAnalyzer._calculate_tag_size(target_field.field_number)
+            total_payload_size = 0
+            
+            for value_line in value_lines:
+                # Extract value from set_field(value) or add_field(value)
+                value_match = re.search(r'(?:set_|add_)\w+\(([^)]+)\)', value_line)
+                if not value_match:
+                    continue
+                
+                num_str = value_match.group(1).strip()
+                try:
+                    # Parse numeric value (same logic as VARINT processing)
+                    if 'U' in num_str or 'u' in num_str:
+                        num_str_clean = num_str.replace('U', '').replace('u', '')
+                        if '0x' in num_str_clean or '0X' in num_str_clean:
+                            num_val = int(num_str_clean, 16)
+                        else:
+                            num_val = int(num_str_clean)
+                    elif '0x' in num_str or '0X' in num_str:
+                        num_val = int(num_str, 16)
+                    elif '.' in num_str:
+                        num_val = int(float(num_str))
+                    else:
+                        num_val = int(num_str)
+                    
+                    # Encode value based on wire type
+                    if target_field.wire_type == 'VARINT':
+                        # Handle encoding (ZigZag, two's complement, etc.)
+                        if target_field.field_type in ['sint32', 'sint64']:
+                            if num_val < 0:
+                                if target_field.field_type == 'sint32':
+                                    encoded_val = (num_val << 1) ^ (num_val >> 31)
+                                else:
+                                    encoded_val = (num_val << 1) ^ (num_val >> 63)
+                            else:
+                                encoded_val = num_val << 1
+                        elif target_field.field_type in ['int32', 'int64']:
+                            if num_val < 0:
+                                if target_field.field_type == 'int32':
+                                    encoded_val = num_val & 0xFFFFFFFF
+                                else:
+                                    encoded_val = num_val & 0xFFFFFFFFFFFFFFFF
+                            else:
+                                encoded_val = num_val
+                        else:
+                            encoded_val = num_val
+                        
+                        varint_size = ProtobufAnalyzer._calculate_varint_size(encoded_val)
+                        total_payload_size += varint_size
+                    elif target_field.wire_type == 'I32':
+                        total_payload_size += 4  # Fixed 4 bytes
+                    elif target_field.wire_type == 'I64':
+                        total_payload_size += 8  # Fixed 8 bytes
+                except (ValueError, AttributeError):
+                    continue
+            
+            if total_payload_size > 0:
+                length_varint_size = ProtobufAnalyzer._calculate_varint_size(total_payload_size)
+                field_size = tag_size + length_varint_size + total_payload_size
+                target_field.size_bytes = field_size
+        else:
+            # Non-packed repeated field: multiple records (tag + value for each)
+            # For strings/bytes: each is a LEN record
+            # For messages: each is a LEN record
+            total_size = 0
+            tag_size = ProtobufAnalyzer._calculate_tag_size(target_field.field_number)
+            
+            for value_line in value_lines:
+                if target_field.field_type in ['string', 'bytes']:
+                    # For strings/bytes, find the opening quote to avoid slow regex on long strings
+                    # Pattern: var->set_field("...") or var->add_field("...")
+                    # Find the opening parenthesis and then the quote
+                    paren_pos = value_line.find('(')
+                    if paren_pos == -1:
+                        continue
+                    
+                    # Look for quote after the opening parenthesis
+                    quote_pos = -1
+                    for i in range(paren_pos + 1, len(value_line)):
+                        if value_line[i] == '"' or value_line[i] == "'":
+                            quote_pos = i
+                            break
+                    
+                    if quote_pos != -1:
+                        # Calculate string length: line length - opening quote position - 1 - 3 for ");"
+                        line_len = len(value_line)
+                        str_len = line_len - (quote_pos + 1) - 3  # +1 to skip opening quote, -3 for ");"
+                        length_varint_size = ProtobufAnalyzer._calculate_varint_size(str_len)
+                        total_size += tag_size + length_varint_size + str_len
+                elif target_field.field_type == 'message':
+                    # Messages: tag + length_varint + message_size for each
+                    # Note: We can't determine nested message size here without more context
+                    # This will be handled by the nested message size calculation
+                    # For now, we'll need to track this separately or handle it differently
+                    pass  # TODO: Handle repeated nested messages
+                else:
+                    # For other types, use regex (shouldn't be common for non-packed repeated)
+                    value_match = re.search(r'(?:set_|add_)\w+\(([^)]+)\)', value_line)
+                    if value_match:
+                        # Handle other types if needed
+                        pass
+            
+            if total_size > 0:
+                target_field.size_bytes = total_size
+
+    # Calculate nested message sizes by summing their field sizes
+    # Process bottom-up (deepest first) so parent fields can use nested message sizes
     nested_message_sizes = {}  # var_name -> size
     
     # Sort nested messages by depth (deepest first) to calculate bottom-up
     nested_vars_by_depth = []
     for var_name, (msg_path, target_msg_name, _) in var_to_message.items():
-        nested_msg = find_nested_message_by_path(message, msg_path)
+        nested_msg = get_message_for_var(var_name, var_to_message, message, all_messages)
         if nested_msg:
             depth = len(msg_path) - 1  # Depth in the path
             nested_vars_by_depth.append((depth, var_name, nested_msg))
@@ -991,8 +1144,34 @@ def calculate_serialized_size_from_set_function(msg_name: str, set_function_body
     
     # Calculate sizes for nested messages from deepest to shallowest
     for depth, var_name, nested_msg in nested_vars_by_depth:
-        # Calculate the size of this nested message
-        nested_size = calculate_nested_message_size(nested_msg, var_name, lines, var_to_message, all_messages, nested_message_sizes, var_to_parent_var)
+        # Calculate the size of this nested message by summing its field sizes
+        nested_size = 0
+        for field in nested_msg.fields:
+            if field.size_bytes is not None:
+                nested_size += field.size_bytes
+            elif field.is_nested_message and field.nested_message_name:
+                # Check if we have a pre-calculated size for this nested-nested message
+                # Find the variable that sets this nested message
+                nested_var = None
+                for var, (var_msg_path, var_target_msg_name, _) in var_to_message.items():
+                    if var_target_msg_name == field.nested_message_name:
+                        # Check if this variable's parent is our current var_name
+                        if var in var_to_field:
+                            parent_msg, parent_field_name = var_to_field[var]
+                            if parent_msg == nested_msg:
+                                nested_var = var
+                                break
+                
+                if nested_var and nested_var in nested_message_sizes:
+                    # Use pre-calculated size for nested message
+                    # Per Protocol Buffers encoding: LEN = tag + length_varint + payload
+                    nested_nested_size = nested_message_sizes[nested_var]
+                    tag_size = ProtobufAnalyzer._calculate_tag_size(field.field_number)
+                    length_varint_size = ProtobufAnalyzer._calculate_varint_size(nested_nested_size)
+                    field_total_size = tag_size + length_varint_size + nested_nested_size
+                    nested_size += field_total_size
+                    field.size_bytes = field_total_size
+        
         nested_message_sizes[var_name] = nested_size
         
         # Update the parent field's size_bytes to include the nested message
@@ -1015,7 +1194,14 @@ def calculate_serialized_size_from_set_function(msg_name: str, set_function_body
         # If size_bytes is None, the field size cannot be determined and is not included
         # This ensures we only count sizes we actually know
 
-    return total_size
+    # Map nested message sizes from variable names to message names
+    nested_sizes_by_name = {}  # message_name -> size
+    for var_name, size in nested_message_sizes.items():
+        if var_name in var_to_message:
+            _, target_msg_name, _ = var_to_message[var_name]
+            nested_sizes_by_name[target_msg_name] = size
+
+    return total_size, nested_sizes_by_name
 
 # Print detailed field and size information for each message recursively
 def print_message_details(msg: Message, indent: int = 0):
@@ -1115,7 +1301,7 @@ def analyze_hyperprotobench(base_path: str) -> Dict:
                 add_to_map(msg)
             
             # Extract Set_F1 functions and calculate sizes
-            message_sizes = {}
+            message_sizes = {}  # message_name -> size (includes both top-level and nested)
             set_pattern = r'int\s+(\w+)_Set_F1[^{]*\{'
             
             i = 0
@@ -1148,11 +1334,14 @@ def analyze_hyperprotobench(base_path: str) -> Dict:
                         break
                 
                 if msg_obj:
-                    # Calculate actual serialized size
-                    size = calculate_serialized_size_from_set_function(
+                    # Calculate actual serialized size and nested message sizes
+                    size, nested_sizes = calculate_serialized_size_from_set_function(
                         msg_name, function_body, msg_obj, all_messages_map
                     )
                     message_sizes[msg_name] = size
+                    # Add nested message sizes to the dictionary
+                    for nested_msg_name, nested_size in nested_sizes.items():
+                        message_sizes[nested_msg_name] = nested_size
                     # print_message_details(msg_obj)
 
             print(f"  Finished calculating serialized sizes for {bench_dir.name}")        
@@ -1162,10 +1351,10 @@ def analyze_hyperprotobench(base_path: str) -> Dict:
                 'benchmark_name': analysis.benchmark_name,
                 'proto_file_path': analysis.proto_file_path,
                 'syntax_version': analysis.syntax_version,
-                'messages_used': sorted(list(messages_used)),
+                'total_size_bytes': sum(message_sizes.values()),
+                'top_level_messages': sorted(list(messages_used)),
                 'messages': [],
                 'message_sizes_bytes': message_sizes,
-                'total_size_bytes': sum(message_sizes.values())
             }
             
             
@@ -1182,11 +1371,12 @@ def analyze_hyperprotobench(base_path: str) -> Dict:
                     'has_nested_messages': msg.has_nested_messages,
                     'has_enums': msg.has_enums,
                     'nested_message_count': len(msg.nested_messages),
+                    'serialized_size_bytes': None,  
                     'fields': [],
                     'nested_messages': []
                 }
                 
-                # Add size if available (only for top-level used messages)
+                # Add size if available (for both top-level and nested messages)
                 if msg.name in message_sizes:
                     msg_data['serialized_size_bytes'] = message_sizes[msg.name]
                 
@@ -1201,11 +1391,8 @@ def analyze_hyperprotobench(base_path: str) -> Dict:
                         'nested_message_name': field.nested_message_name,
                         'is_enum': field.is_enum,
                         'enum_name': field.enum_name,
+                        'size_bytes': field.size_bytes,  # Include size_bytes for all fields (can be None)
                     }
-                    
-                    # Add size for LEN fields (from runtime values)
-                    if field.wire_type == 'LEN' and field.size_bytes is not None:
-                        field_data['size_bytes'] = field.size_bytes
                     
                     msg_data['fields'].append(field_data)
                 
@@ -1333,10 +1520,6 @@ def save_json_report(results: Dict, output_path: str):
     print(f"\nDetailed analysis saved to: {output_path}")
 
 
-# def extract_ml_features(results: Dict) -> Dict:
-#     """Extract ML features from the benchmark analysis results"""
-    
-
 def main():
     """Main entry point"""
     import argparse
@@ -1360,12 +1543,6 @@ def main():
         action='store_true',
         help='Print summary to console'
     )
-    # parser.add_argument(
-    #     '--output-ml-features',
-    #     type=str,
-    #     default='ml_features.json',
-    #     help='Output ML features JSON file path'
-    # )
     
     args = parser.parse_args()
     
@@ -1384,7 +1561,10 @@ def main():
     print(f"Analyzing protobuf workloads in: {hyperprotobench_path}")
     
     # Analyze all benchmarks
+    start_time = time.time()
     results = analyze_hyperprotobench(str(hyperprotobench_path))
+    end_time = time.time()
+    print(f"Analysis complete in {end_time - start_time} seconds")
     
     if not results:
         print("No benchmarks found or analyzed.")
@@ -1398,10 +1578,6 @@ def main():
     output_path = script_dir / args.output
     save_json_report(results, str(output_path))
 
-    # # Extract ML features
-    # ml_features = extract_ml_features(results)
-    # save_json_report(ml_features, str(args.output_ml_features))
-    
     print(f"\nAnalysis complete! Analyzed {len(results)} benchmarks.")
 
 

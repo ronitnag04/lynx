@@ -4,7 +4,7 @@ This directory contains analytical tools for analyzing protobuf workloads and es
 
 ## Protobuf Analyzer
 
-A comprehensive Python tool (`protobuf_analyzer.py`) for analyzing Protocol Buffers message definitions from HyperProtoBench benchmarks. The analyzer extracts detailed metadata, statistics, and configurations from protobuf `.proto` files.
+A comprehensive Python tool (`protobuf_analyzer.py`) for analyzing Protocol Buffers message definitions from HyperProtoBench benchmarks. The analyzer extracts detailed metadata, statistics, and configurations from protobuf `.proto` and `.inc` files.
 
 ### Features
 
@@ -17,21 +17,8 @@ A comprehensive Python tool (`protobuf_analyzer.py`) for analyzing Protocol Buff
 - **Field Analysis**: Detailed field information including:
   - Field types (int32, int64, string, bytes, message, enum, etc.)
   - Cardinality (optional, required, repeated)
-  - Wire types (VARINT, FIXED32, FIXED64, LENGTH_DELIMITED)
-  - Field numbers and estimated sizes
-
-- **Structure Analysis**:
-  - Recursive parsing of nested messages
-  - Enum detection (top-level and nested)
-  - Maximum nesting depth calculation
-  - Repeated field identification
-
-- **Statistics Generation**:
-  - Field type distribution across all messages
-  - Cardinality distribution (optional/required/repeated)
-  - Wire type distribution
-  - Per-benchmark summaries
-
+  - Wire types (VARINT, I32, I64, LEN)
+  - Field sizes in bytes extracted from .inc files
 
 ### Usage
 
@@ -73,10 +60,3 @@ The tool generates two types of output:
 - [Protocol Buffers Documentation](https://protobuf.dev/)
 - ProtoAcc MICRO 2021 Paper: "A Hardware Accelerator for Protocol Buffers"
 - HyperProtoBench: Representative protobuf workloads from Google's datacenter fleet
-
-#### Notes
-
-- The analyzer uses regex-based parsing and handles nested messages recursively
-- Estimated sizes are approximations based on fixed-size types only
-- Variable-length types (string, bytes, messages) are marked with `null` estimated size
-- The tool correctly handles proto2 syntax with optional/required/repeated fields
