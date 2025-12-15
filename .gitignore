@@ -15,3 +15,10 @@ analytical_model/*.json
 
 # Ignore plots in analytical_model
 analytical_model/plots/
+
+# Ignore plots in ml_model
+ml_model/plots/
+
+# Ignore json/jsonl files in ml_model
+ml_model/*/*.json
+ml_model/*/*.jsonl
