@@ -1,0 +1,3 @@
+[submodule "HyperProtoBench"]
+	path = HyperProtoBench
+	url = https://github.com/google/HyperProtoBench.git

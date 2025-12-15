@@ -1530,6 +1530,7 @@ def main():
     parser.add_argument(
         '--hyperprotobench-path',
         type=str,
+        default=Path(__file__).parent.parent / 'HyperProtoBench',
         help='Path to HyperProtoBench directory'
     )
     parser.add_argument(
