@@ -119,25 +119,18 @@ def main() -> None:
 
         print('----------- Start Training --------------')
         print(f"HyperParams: {asdict(hyperparams)}")
-        metrics: list[dict[str, float]] = []
-        epoch_timings: list[dict[str, float]] = []
+        epochs_data: list[dict[str, float]] = []
         total_start = time.perf_counter()
         for epoch in range(1, hyperparams.epochs + 1):
             epoch_start = time.perf_counter()
             train_loss = train_epoch(model, train_loader, loss_fn, optimizer, device)
             eval_loss = evaluate(model, test_loader, loss_fn, device)
             epoch_duration = time.perf_counter() - epoch_start
-            metrics.append(
+            epochs_data.append(
                 {
-                    "epoch": epoch,
+                    "duration": epoch_duration,
                     "train_loss": float(train_loss),
                     "eval_loss": float(eval_loss),
-                }
-            )
-            epoch_timings.append(
-                {
-                    "epoch": epoch,
-                    "duration_seconds": epoch_duration,
                 }
             )
             print(f"Epoch {epoch:02d} | Train Loss: {train_loss:.4f} | Eval Loss: {eval_loss:.4f}")
@@ -150,15 +143,12 @@ def main() -> None:
         xm.save(checkpoint, checkpoint_path)
 
         os.makedirs("training_metrics", exist_ok=True)
-        metrics_path = os.path.join("training_metrics", f"{dataset_type}_losses.json")
+        metrics_path = os.path.join("training_metrics", f"{dataset_type}_metrics.json")
         with open(metrics_path, "w", encoding="utf-8") as f:
-            json.dump(metrics, f, indent=2)
-        timings_path = os.path.join("training_metrics", f"{dataset_type}_timings.json")
-        with open(timings_path, "w", encoding="utf-8") as f:
             json.dump(
                 {
-                    "total_duration_seconds": total_duration,
-                    "epochs": epoch_timings,
+                    "total_duration": total_duration,
+                    "epochs": epochs_data,
                 },
                 f,
                 indent=2,
