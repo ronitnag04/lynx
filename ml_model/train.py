@@ -31,7 +31,7 @@ class HyperParams:
 DEFAULT_HPARAMS = HyperParams(
     learning_rate=1e-3,
     batch_size=64,
-    epochs=20,
+    epochs=2000,
 )
 
 
@@ -58,9 +58,11 @@ def train_epoch(model: nn.Module, loader: DataLoader, loss_fn: nn.Module, optimi
     return total_loss / max(len(loader), 1)
 
 
-def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device: str) -> float:
+def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device: str) -> tuple[float, float]:
     model.eval()
     total_loss = 0.0
+    total_percent_error = 0.0
+    num_batches = 0
     with torch.no_grad():
         for inputs, targets in loader:
             inputs = inputs.view(inputs.size(0), -1)
@@ -70,7 +72,19 @@ def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device:
             loss = criterion(outputs, targets)
             torch_xla.sync() 
             total_loss += loss.detach().to("cpu")
-    return total_loss / max(len(loader), 1)
+            # Compute mean absolute percent error for this batch.
+            # Add small epsilon to denominator to avoid division by zero.
+            eps = 1e-8
+            batch_percent_error = (
+                (torch.abs(outputs - targets) / (torch.abs(targets) + eps)).mean() * 100.0
+            )
+            total_percent_error += batch_percent_error.detach().to("cpu")
+            num_batches += 1
+
+    denom = max(num_batches, 1)
+    avg_loss = total_loss / denom
+    avg_percent_error = total_percent_error / denom
+    return float(avg_loss), float(avg_percent_error)
 
 
 def parse_args() -> argparse.Namespace:
@@ -87,7 +101,7 @@ def main() -> None:
     args = parse_args()
     hyperparams = DEFAULT_HPARAMS
 
-    for dataset_type in ["deserializer", "serializer"]:
+    for dataset_type in ["sha3"]:
         dataset_dir = os.path.join(args.data_dir, dataset_type + "_dataset")
 
         train_features_path = os.path.join(dataset_dir, "train_features.npy")
@@ -103,17 +117,12 @@ def main() -> None:
         batch_size = hyperparams.batch_size
         input_size = train_ds[0][0].shape[0]
 
-        # Batch dimension must be a multiple of the batch size for Neuron/XLA compilation.
-        if train_size % batch_size != 0:
-            raise ValueError(f"Train dataset batch dimension {train_size} must be a multiple of the batch size {batch_size}.")
-        if test_size % batch_size != 0:
-            raise ValueError(f"Test dataset batch dimension {test_size} must be a multiple of the batch size {batch_size}.")
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
         test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
 
         device = "xla"
 
-        model = LynxMLModel(input_size=input_size, hidden_dims=(64, 32, 16), output_size=1).to(device)
+        model = LynxMLModel(input_size=input_size, hidden_dims=(16, 8, 4), output_size=1).to(device)
         optimizer = optim.Adam(model.parameters(), lr=hyperparams.learning_rate)
         loss_fn = nn.L1Loss()
 
@@ -124,16 +133,22 @@ def main() -> None:
         for epoch in range(1, hyperparams.epochs + 1):
             epoch_start = time.perf_counter()
             train_loss = train_epoch(model, train_loader, loss_fn, optimizer, device)
-            eval_loss = evaluate(model, test_loader, loss_fn, device)
+            eval_loss, percent_error = evaluate(model, test_loader, loss_fn, device)
             epoch_duration = time.perf_counter() - epoch_start
             epochs_data.append(
                 {
                     "duration": epoch_duration,
                     "train_loss": float(train_loss),
                     "eval_loss": float(eval_loss),
+                    "percent_error": float(percent_error),
                 }
             )
-            print(f"Epoch {epoch:02d} | Train Loss: {train_loss:.4f} | Eval Loss: {eval_loss:.4f}")
+            print(
+                f"Epoch {epoch:02d} | "
+                f"Train Loss: {train_loss:.4f} | "
+                f"Eval Loss: {eval_loss:.4f} | "
+                f"Percent Error: {percent_error:.2f}%"
+            )
         print('------------ End Training ---------------')
         total_duration = time.perf_counter() - total_start
 

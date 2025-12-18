@@ -14,22 +14,11 @@ def load_losses(path: Path) -> Tuple[list[int], list[float], list[float]]:
     with path.open() as f:
         data = json.load(f)
 
-    epochs: list[int] = []
-    train_losses: list[float] = []
-    eval_losses: list[float] = []
+    epochs_data = data["epochs"]
 
-    for entry in data:
-        # Defensive: skip malformed rows rather than failing mid-loop.
-        if not all(k in entry for k in ("epoch", "train_loss", "eval_loss")):
-            continue
-        epochs.append(int(entry["epoch"]))
-        train_losses.append(float(entry["train_loss"]))
-        eval_losses.append(float(entry["eval_loss"]))
-
-    # # Remove the first epoch (outlier)
-    # epochs = epochs[1:]
-    # train_losses = train_losses[1:]
-    # eval_losses = eval_losses[1:]
+    epochs = range(len(epochs_data))
+    train_losses = [epoch["train_loss"] for epoch in epochs_data]
+    eval_losses = [epoch["eval_loss"] for epoch in epochs_data]
 
     return epochs, train_losses, eval_losses
 
@@ -50,6 +39,7 @@ def plot_losses(
     plt.title(title)
     plt.legend()
     plt.grid(True, linestyle="--", alpha=0.5)
+    plt.ylim(bottom=0)
     plt.tight_layout()
     plt.savefig(output_path)
     plt.close()
@@ -61,30 +51,18 @@ def main() -> None:
     plots_dir = base_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
-    serializer_path = metrics_dir / "serializer_losses.json"
-    deserializer_path = metrics_dir / "deserializer_losses.json"
+    sha3_path = metrics_dir / "sha3_metrics.json"
 
     plt.switch_backend("Agg")  # ensure headless execution is fine
 
-    serializer_epochs, serializer_train, serializer_eval = load_losses(serializer_path)
+    sha3_epochs, sha3_train, sha3_eval = load_losses(sha3_path)
 
     plot_losses(
-        serializer_epochs,
-        serializer_train,
-        serializer_eval,
-        title="Serializer Train vs Eval Loss",
-        output_path=plots_dir / "serializer_losses.png",
-    )
-
-    deserializer_epochs, deserializer_train, deserializer_eval = load_losses(
-        deserializer_path
-    )
-    plot_losses(
-        deserializer_epochs,
-        deserializer_train,
-        deserializer_eval,
-        title="Deserializer Train vs Eval Loss",
-        output_path=plots_dir / "deserializer_losses.png",
+        sha3_epochs,
+        sha3_train,
+        sha3_eval,
+        title="SHA3 Train vs Eval Loss",
+        output_path=plots_dir / "sha3_losses.png",
     )
 
     print(f"Saved plots to {plots_dir}")
