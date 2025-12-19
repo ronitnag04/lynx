@@ -101,7 +101,7 @@ def main() -> None:
     args = parse_args()
     hyperparams = DEFAULT_HPARAMS
 
-    for dataset_type in ["sha3"]:
+    for dataset_type in ["compressacc"]:
         dataset_dir = os.path.join(args.data_dir, dataset_type + "_dataset")
 
         train_features_path = os.path.join(dataset_dir, "train_features.npy")
@@ -143,12 +143,14 @@ def main() -> None:
                     "percent_error": float(percent_error),
                 }
             )
-            print(
-                f"Epoch {epoch:02d} | "
-                f"Train Loss: {train_loss:.4f} | "
-                f"Eval Loss: {eval_loss:.4f} | "
-                f"Percent Error: {percent_error:.2f}%"
-            )
+            PRINT_EVERY_N_EPOCHS = 100
+            if epoch % PRINT_EVERY_N_EPOCHS == 0:
+                print(
+                    f"Epoch {epoch:02d} | "
+                    f"Train Loss: {train_loss:.4f} | "
+                    f"Eval Loss: {eval_loss:.4f} | "
+                    f"Percent Error: {percent_error:.2f}%"
+                )
         print('------------ End Training ---------------')
         total_duration = time.perf_counter() - total_start
 

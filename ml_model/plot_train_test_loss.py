@@ -77,7 +77,7 @@ def main() -> None:
     plots_dir = base_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
-    sha3_path = metrics_dir / "sha3_metrics.json"
+    sha3_path = metrics_dir / "compressacc_metrics.json"
 
     plt.switch_backend("Agg")  # ensure headless execution is fine
 
@@ -87,8 +87,8 @@ def main() -> None:
         sha3_epochs,
         sha3_train,
         sha3_eval,
-        title="SHA3 Train vs Eval Loss",
-        output_path=plots_dir / "sha3_losses.png",
+        title="CompressAcc Train vs Eval Loss",
+        output_path=plots_dir / "compress_losses.png",
         max_points=MAX_POINTS,
     )
 
