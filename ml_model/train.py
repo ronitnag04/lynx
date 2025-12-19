@@ -31,7 +31,7 @@ class HyperParams:
 DEFAULT_HPARAMS = HyperParams(
     learning_rate=1e-3,
     batch_size=64,
-    epochs=2000,
+    epochs=5000,
 )
 
 
@@ -122,7 +122,7 @@ def main() -> None:
 
         device = "xla"
 
-        model = LynxMLModel(input_size=input_size, hidden_dims=(16, 8, 4), output_size=1).to(device)
+        model = LynxMLModel(input_size=input_size, hidden_dims=(64, 32, 16), output_size=1).to(device)
         optimizer = optim.Adam(model.parameters(), lr=hyperparams.learning_rate)
         loss_fn = nn.L1Loss()
 
