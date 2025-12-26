@@ -12,6 +12,7 @@ import json
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Any, Optional
+import time
 
 def create_frequency_distribution(values: List[float], num_bins: int = 10) -> List[float]:
     """
@@ -109,6 +110,7 @@ def extract_features_for_benchmark(benchmark_data: Dict[str, Any]) -> Dict[str, 
 
 def main():
     """Main function to extract features from protobuf_analysis.json"""
+    start_time = time.time()
     # Path to the analysis JSON file
     script_dir = Path(__file__).parent
     json_path = script_dir / "protobuf_analysis.json"
@@ -135,7 +137,8 @@ def main():
     
     print(f"Successfully extracted features for {len(features)} benchmarks")
     print(f"Features saved to {output_path}")
-
+    end_time = time.time()
+    print(f"Time taken: {end_time - start_time} seconds")
 
 if __name__ == "__main__":
     main()
