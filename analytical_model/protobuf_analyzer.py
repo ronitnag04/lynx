@@ -1355,7 +1355,29 @@ def analyze_hyperprotobench(base_path: str) -> Dict:
                 'top_level_messages': sorted(list(messages_used)),
                 'messages': [],
                 'message_sizes_bytes': message_sizes,
+                'statistics': {
+                    'total_messages': analysis.total_messages,
+                    'total_fields': analysis.total_fields,
+                    'max_nesting_depth': analysis.max_nesting_depth,
+                    'repeated_field_count': analysis.repeated_field_count,
+                    'enum_count': analysis.enum_count,
+                    'nested_message_count': analysis.nested_message_count,
+                },
+                'field_type_distribution': analysis.field_type_distribution,
+                'cardinality_distribution': analysis.cardinality_distribution,
+                'wire_type_distribution': analysis.wire_type_distribution,
             }
+
+            if analysis.benchmark_config is not None:
+                results[bench_dir.name]['runtime_config'] = {
+                    'working_set_size': analysis.benchmark_config.working_set_size,
+                    'iterations': analysis.benchmark_config.iterations,
+                    'messages_used': analysis.benchmark_config.messages_used,
+                    'messages_used_count': len(analysis.benchmark_config.messages_used),
+                }
+
+            if analysis.operation_statistics is not None:
+                results[bench_dir.name]['operation_statistics'] = analysis.operation_statistics
             
             
             # Helper function to recursively add messages (only used ones and their nested messages)
@@ -1471,9 +1493,9 @@ def print_summary(results: Dict):
             print(f"  Unique Messages Used: {ops.get('unique_messages_used', 0)}")
         
         # Show serialized sizes if available
-        if 'serialized_sizes' in data:
-            sizes = data['serialized_sizes']
-            print(f"\nSerialized Sizes:")
+        if 'message_sizes_bytes' in data and data['message_sizes_bytes']:
+            sizes = data['message_sizes_bytes']
+            print(f"\nSerialized Sizes (top 5):")
             sorted_sizes = sorted(sizes.items(), key=lambda x: x[1], reverse=True)[:5]
             for msg_name, size in sorted_sizes:
                 print(f"  {msg_name:20s}: {size:8,d} bytes")
@@ -1491,15 +1513,11 @@ def print_summary(results: Dict):
             if msg['has_nested_messages']:
                 nested_info = f", {len([m for m in data['messages'] if m.get('parent') == msg['name']])} nested msgs"
             size_info = ""
-            if 'serialized_size_bytes' in msg:
+            if msg.get('serialized_size_bytes') is not None:
                 size_info = f", {msg['serialized_size_bytes']:,} bytes"
-            runtime_info = ""
-            if 'runtime_data' in msg:
-                rt = msg['runtime_data']
-                runtime_info = f", {rt['total_string_bytes'] + rt['total_bytes_bytes']:,} str/bytes"
             print(f"  {msg['name']:20s}: {msg['total_fields']:3d} fields, "
                   f"max field #: {msg['max_field_number']:3d}, "
-                  f"depth: {msg['depth']}{nested_info}{size_info}{runtime_info}")
+                  f"depth: {msg['depth']}{nested_info}{size_info}")
         
         # Show nested message statistics
         nested_msg_count = sum(1 for m in data['messages'] if m['depth'] > 0)
