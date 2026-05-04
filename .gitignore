@@ -22,3 +22,6 @@ ml_model/plots/
 # Ignore json/jsonl files in ml_model
 ml_model/*/*.json
 ml_model/*/*.jsonl
+
+# Ignore datasets in ml_model
+ml_model/data/
