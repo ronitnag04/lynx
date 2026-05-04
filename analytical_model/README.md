@@ -38,6 +38,45 @@ python3 protobuf_analyzer.py --output my_analysis.json --hyperprotobench-path $H
 - `--hyperprotobench-path`: Path to HyperProtoBench directory
 - `--output`: Output JSON file path (default: `protobuf_analysis.json`)
 - `--summary`: Print summary statistics to console
+- `--verilator-bench-profile`: Cap the serialized-size computation to match what the Verilator-resident ProtoAcc bench actually exercises (skip repeated fields, cap per-field string/bytes at 1024 B, treat submessages at nesting depth ≥ 5 as zero). Use this when the downstream ML model should see features that line up with the measured cycle counts from `sims/verilator`.
+- `--max-string-len N`: Cap string/bytes payload length (overrides the bench profile for this single knob).
+- `--max-nested-depth N`: Messages at nesting depth ≥ N contribute zero (overrides bench profile).
+- `--skip-repeated`: Treat all repeated fields as absent (overrides bench profile).
+
+#### Workload profiles
+
+The analyzer supports a ``WorkloadProfile`` that caps the size calculation to
+reflect what a specific execution environment actually runs. The canonical
+profile is ``WorkloadProfile.verilator_bench_default()``, which matches the
+defaults used by
+`generators/protoacc/software/verilator-bench/gen/proto_to_accel.py` in the
+Chipyard tree:
+
+| Cap                 | Value  | Why                                                                                          |
+|---------------------|--------|----------------------------------------------------------------------------------------------|
+| ``max_string_len``  | 1024 B | Real HPB strings reach MBs; the Verilator bench caps at 1 KB for feasibility. |
+| ``max_nested_depth``| 5      | Bench2's schema nests up to depth 13; Verilator bench tops out at 5.  |
+| ``skip_repeated``   | True   | Generator skips `repeated` fields (about 3% of HPB fields).               |
+
+When the Verilator-bench profile is used, `total_size_bytes` drops roughly
+10–100× vs. the full-HPB figure (e.g. bench2: 29 MB → 22 KB), landing in the
+same order of magnitude as the on-wire bytes measured by
+`generators/protoacc/software/verilator-bench/benchmark_results.json`.
+
+Typical two-output workflow — produce both the full-HPB feature set and the
+Verilator-bench-scoped one side by side:
+
+```bash
+# Full HPB features (for reference / offline comparisons)
+python3 protobuf_analyzer.py --output protobuf_analysis.json
+python3 extract_features.py --input protobuf_analysis.json --output extracted_features_full.json
+
+# Verilator-bench-scoped features (what the ML model should train on)
+python3 protobuf_analyzer.py --verilator-bench-profile \
+    --output protobuf_analysis_verilator_bench.json
+python3 extract_features.py --input protobuf_analysis_verilator_bench.json \
+    --output extracted_features.json
+```
 
 #### Output Format
 

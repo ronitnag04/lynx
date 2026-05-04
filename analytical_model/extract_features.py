@@ -108,33 +108,43 @@ def extract_features_for_benchmark(benchmark_data: Dict[str, Any]) -> Dict[str, 
 
 
 def main():
-    """Main function to extract features from protobuf_analysis.json"""
-    # Path to the analysis JSON file
+    """Extract features from a protobuf_analysis.json produced by protobuf_analyzer.py.
+
+    Defaults read/write the canonical filenames in the analytical_model/ dir so
+    the extract-->features pipeline is a single-command rerun:
+
+        python3 protobuf_analyzer.py --verilator-bench-profile
+        python3 extract_features.py
+
+    Use --input / --output to read/write an alternate pair when keeping both
+    the full-HPB and Verilator-bench-scoped feature sets side by side.
+    """
+    import argparse
+
     script_dir = Path(__file__).parent
-    json_path = script_dir / "protobuf_analysis.json"
-    
-    if not json_path.exists():
-        raise FileNotFoundError(f"Could not find {json_path}")
-    
-    # Read the JSON file
-    print(f"Reading {json_path}...")
-    with open(json_path, 'r') as f:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", type=Path, default=script_dir / "protobuf_analysis.json")
+    ap.add_argument("--output", type=Path, default=script_dir / "extracted_features.json")
+    args = ap.parse_args()
+
+    if not args.input.exists():
+        raise FileNotFoundError(f"Could not find {args.input}")
+
+    print(f"Reading {args.input}...")
+    with open(args.input, 'r') as f:
         data = json.load(f)
-    
-    # Extract features for each benchmark
+
     features = {}
     for benchmark_name, benchmark_data in data.items():
         print(f"Processing {benchmark_name}...")
         features[benchmark_name] = extract_features_for_benchmark(benchmark_data)
-    
-    # Output the features
-    output_path = script_dir / "extracted_features.json"
-    print(f"Writing features to {output_path}...")
-    with open(output_path, 'w') as f:
+
+    print(f"Writing features to {args.output}...")
+    with open(args.output, 'w') as f:
         json.dump(features, f, indent=2)
-    
+
     print(f"Successfully extracted features for {len(features)} benchmarks")
-    print(f"Features saved to {output_path}")
+    print(f"Features saved to {args.output}")
 
 
 if __name__ == "__main__":
