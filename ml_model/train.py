@@ -19,6 +19,8 @@ from model import LynxMLModel
 # XLA imports
 import torch_xla.core.xla_model as xm
 import torch_xla
+from sklearn.preprocessing import StandardScaler
+import joblib
 
 
 @dataclass(frozen=True)
@@ -31,7 +33,7 @@ class HyperParams:
 DEFAULT_HPARAMS = HyperParams(
     learning_rate=1e-3,
     batch_size=64,
-    epochs=20,
+    epochs=1000,
 )
 
 
@@ -44,6 +46,7 @@ def load_numpy_dataset(features_path: str, labels_path: str) -> TensorDataset:
 def train_epoch(model: nn.Module, loader: DataLoader, loss_fn: nn.Module, optimizer: optim.Optimizer, device: str) -> float:
     model.train()
     total_loss = 0.0
+    num_batches = 0
     for inputs, targets in loader:
         inputs = inputs.view(inputs.size(0), -1)
         inputs = inputs.to(device)
@@ -54,13 +57,16 @@ def train_epoch(model: nn.Module, loader: DataLoader, loss_fn: nn.Module, optimi
         loss.backward()
         optimizer.step()
         torch_xla.sync()
-        total_loss += loss.detach().to("cpu")
-    return total_loss / max(len(loader), 1)
+        total_loss += loss.item()
+        num_batches += 1
+    return float(total_loss / max(num_batches, 1))
 
 
-def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device: str) -> float:
+def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device: str) -> tuple[float, float]:
     model.eval()
     total_loss = 0.0
+    total_percent_error = 0.0
+    num_batches = 0
     with torch.no_grad():
         for inputs, targets in loader:
             inputs = inputs.view(inputs.size(0), -1)
@@ -68,9 +74,18 @@ def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device:
             targets = targets.to(device)
             outputs = model(inputs)
             loss = criterion(outputs, targets)
-            torch_xla.sync() 
-            total_loss += loss.detach().to("cpu")
-    return total_loss / max(len(loader), 1)
+            torch_xla.sync()
+            total_loss += loss.item()
+            # Compute mean absolute percent error for this batch; avoid div-by-zero with eps.
+            eps = 1e-8
+            batch_percent_error = ((torch.abs(outputs - targets) / (torch.abs(targets) + eps)).mean() * 100.0)
+            total_percent_error += batch_percent_error.item()
+            num_batches += 1
+
+    denom = max(num_batches, 1)
+    avg_loss = total_loss / denom
+    avg_percent_error = total_percent_error / denom
+    return float(avg_loss), float(avg_percent_error)
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,6 +94,12 @@ def parse_args() -> argparse.Namespace:
         "--data-dir",
         default="data",
         help="Path to folder containing 'deserializer_dataset' and 'serializer_dataset' folders.",
+    )
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        default="training_results",
+        help="Output directory for checkpoint and metrics files",
     )
     return parser.parse_args()
 
@@ -95,19 +116,31 @@ def main() -> None:
         test_features_path = os.path.join(dataset_dir, "test_features.npy")
         test_labels_path = os.path.join(dataset_dir, "test_labels.npy")
 
-        train_ds = load_numpy_dataset(train_features_path, train_labels_path)
-        test_ds = load_numpy_dataset(test_features_path, test_labels_path)
+        # Load raw numpy arrays
+        train_features_np = np.load(train_features_path)
+        train_labels_np = np.load(train_labels_path)
+        test_features_np = np.load(test_features_path)
+        test_labels_np = np.load(test_labels_path)
+
+        # Standardize features with a shared scaler (fit on train)
+        scaler = StandardScaler()
+        train_features_np = scaler.fit_transform(train_features_np)
+        test_features_np = scaler.transform(test_features_np)
+
+        # Convert to tensors and datasets
+        train_features_t = torch.from_numpy(train_features_np).float()
+        train_labels_t = torch.from_numpy(train_labels_np).float()
+        test_features_t = torch.from_numpy(test_features_np).float()
+        test_labels_t = torch.from_numpy(test_labels_np).float()
+
+        train_ds = TensorDataset(train_features_t, train_labels_t)
+        test_ds = TensorDataset(test_features_t, test_labels_t)
 
         train_size = len(train_ds)
         test_size = len(test_ds)
         batch_size = hyperparams.batch_size
-        input_size = train_ds[0][0].shape[0]
+        input_size = train_features_t.shape[1]
 
-        # Batch dimension must be a multiple of the batch size for Neuron/XLA compilation.
-        if train_size % batch_size != 0:
-            raise ValueError(f"Train dataset batch dimension {train_size} must be a multiple of the batch size {batch_size}.")
-        if test_size % batch_size != 0:
-            raise ValueError(f"Test dataset batch dimension {test_size} must be a multiple of the batch size {batch_size}.")
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
         test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
 
@@ -124,26 +157,36 @@ def main() -> None:
         for epoch in range(1, hyperparams.epochs + 1):
             epoch_start = time.perf_counter()
             train_loss = train_epoch(model, train_loader, loss_fn, optimizer, device)
-            eval_loss = evaluate(model, test_loader, loss_fn, device)
+            eval_loss, percent_error = evaluate(model, test_loader, loss_fn, device)
             epoch_duration = time.perf_counter() - epoch_start
             epochs_data.append(
                 {
                     "duration": epoch_duration,
                     "train_loss": float(train_loss),
                     "eval_loss": float(eval_loss),
+                    "percent_error": float(percent_error),
                 }
             )
-            print(f"Epoch {epoch:02d} | Train Loss: {train_loss:.4f} | Eval Loss: {eval_loss:.4f}")
+            print(
+                f"Epoch {epoch:02d} | "
+                f"Train Loss: {train_loss:.4f} | "
+                f"Eval Loss: {eval_loss:.4f} | "
+                f"Percent Error: {percent_error:.2f}% | "
+                f"Time: {epoch_duration:.2f}s"
+            )
         print('------------ End Training ---------------')
         total_duration = time.perf_counter() - total_start
 
-        os.makedirs("checkpoints", exist_ok=True)
-        checkpoint_path = os.path.join("checkpoints", f"{dataset_type}_checkpoint.pt")
+        os.makedirs(args.output_dir, exist_ok=True)
+        checkpoint_path = os.path.join(args.output_dir, f"{dataset_type}_checkpoint.pt")
         checkpoint = {'state_dict': model.state_dict()}
         xm.save(checkpoint, checkpoint_path)
 
-        os.makedirs("training_metrics", exist_ok=True)
-        metrics_path = os.path.join("training_metrics", f"{dataset_type}_metrics.json")
+        # Persist preprocessing artifacts so inference can reproduce training transforms.
+        scaler_path = os.path.join(args.output_dir, f"{dataset_type}_scaler.joblib")
+        joblib.dump(scaler, scaler_path)
+
+        metrics_path = os.path.join(args.output_dir, f"{dataset_type}_metrics.json")
         with open(metrics_path, "w", encoding="utf-8") as f:
             json.dump(
                 {

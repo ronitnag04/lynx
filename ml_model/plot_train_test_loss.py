@@ -14,22 +14,16 @@ def load_losses(path: Path) -> Tuple[list[int], list[float], list[float]]:
     with path.open() as f:
         data = json.load(f)
 
+    entries = data["epochs"]
+
     epochs: list[int] = []
     train_losses: list[float] = []
     eval_losses: list[float] = []
 
-    for entry in data:
-        # Defensive: skip malformed rows rather than failing mid-loop.
-        if not all(k in entry for k in ("epoch", "train_loss", "eval_loss")):
-            continue
-        epochs.append(int(entry["epoch"]))
+    for i, entry in enumerate(entries):
+        epochs.append(i)
         train_losses.append(float(entry["train_loss"]))
         eval_losses.append(float(entry["eval_loss"]))
-
-    # # Remove the first epoch (outlier)
-    # epochs = epochs[1:]
-    # train_losses = train_losses[1:]
-    # eval_losses = eval_losses[1:]
 
     return epochs, train_losses, eval_losses
 
@@ -57,12 +51,12 @@ def plot_losses(
 
 def main() -> None:
     base_dir = Path(__file__).resolve().parent
-    metrics_dir = base_dir / "training_metrics"
+    metrics_dir = base_dir / "training_results"
     plots_dir = base_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
-    serializer_path = metrics_dir / "serializer_losses.json"
-    deserializer_path = metrics_dir / "deserializer_losses.json"
+    serializer_path = metrics_dir / "serializer_metrics.json"
+    deserializer_path = metrics_dir / "deserializer_metrics.json"
 
     plt.switch_backend("Agg")  # ensure headless execution is fine
 
