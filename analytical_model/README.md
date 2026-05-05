@@ -49,7 +49,7 @@ The analyzer supports a ``WorkloadProfile`` that caps the size calculation to
 reflect what a specific execution environment actually runs. The canonical
 profile is ``WorkloadProfile.verilator_bench_default()``, which matches the
 defaults used by
-`generators/protoacc/software/verilator-bench/gen/proto_to_accel.py` in the
+`generators/protoacc/software/verilator-bench/proto_to_accel.py` in the
 Chipyard tree:
 
 | Cap                 | Value  | Why                                                                                          |

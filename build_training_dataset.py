@@ -6,7 +6,7 @@ analytical features into per-side training datasets for the Lynx ML model.
 Inputs:
   --sweep-csv CSV      From
                        /home/ec2-user/hyperscale-grpc-chipyard/generators/
-                       protoacc/software/verilator-bench/run_sweep.py — one row
+                       protoacc/software/verilator-bench/run_sweep.sh — one row
                        per (hw_config x bench x op) with cycle/byte/throughput
                        and the hardware parameter knobs. Rows are tagged with
                        op=ser|des; this script splits by op.
@@ -181,7 +181,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sweep-csv", type=Path, required=True,
-                    help="Sweep results CSV from run_sweep.py (may contain "
+                    help="Sweep results CSV from run_sweep.sh (may contain "
                          "both ser and des rows; split by op column).")
     ap.add_argument("--features", type=Path, default=DEFAULT_FEATURES,
                     help=f"Analytical features JSON (default: {DEFAULT_FEATURES})")
