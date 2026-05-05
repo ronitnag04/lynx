@@ -55,6 +55,11 @@ cd ..
 #    The run appends one row per (config, bench, op) to the CSV; re-running
 #    resumes at the first missing row. Scope with --bench/--benches/--op/--side
 #    for a smaller smoke test.
+#
+#    config_name encodes the varied parameters directly (e.g.
+#    ProtoAccelDesSweepDC4DDFQ8...Config, ProtoAccelSerSweepSF6SC4...Config),
+#    so --emit des and --emit ser runs can be kept in separate CSVs and later
+#    concatenated (pandas.concat) without config_name collisions.
 python3 "${CHIPYARD_ROOT}/generators/protoacc/software/verilator-bench/gen_protoacc_sweep_configs.py" \
     --emit both -t random -n 32 -s 42
 bash "${CHIPYARD_ROOT}/generators/protoacc/software/verilator-bench/run_sweep.sh" \
