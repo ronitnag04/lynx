@@ -11,9 +11,7 @@ class LynxMLModel(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dims[0], hidden_dims[1]),
             nn.ReLU(),
-            nn.Linear(hidden_dims[1], hidden_dims[2]),
-            nn.ReLU(),
-            nn.Linear(hidden_dims[2], output_size),
+            nn.Linear(hidden_dims[1], output_size),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

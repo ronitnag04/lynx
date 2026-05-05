@@ -4,43 +4,96 @@ import argparse
 import json
 import os
 import time
-from dataclasses import asdict, dataclass
 from typing import Iterable
 
-import numpy as np
+import joblib
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch_xla
+import torch_xla.core.xla_model as xm
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
-from torchvision.transforms import ToTensor
 
 from model import LynxMLModel
 
-# XLA imports
-import torch_xla.core.xla_model as xm
-import torch_xla
-from sklearn.preprocessing import StandardScaler
-import joblib
+LABEL_COLUMN = "throughput_gbits_per_sec"
+FALLBACK_LABEL_COLUMN = "throughput_bytes_per_sec"
+FEATURE_PREFIX = "feat_"
+SIDE_TO_NAME = {"des": "deserializer", "ser": "serializer"}
+
+DES_PARAM_VALUES = [
+    "des_top_descriptor_reqs",
+    "des_top_memloader_reqs",
+    "des_cr_rocc_commands",
+    "des_dth_l1_reqs",
+    "des_dth_fd_reqs",
+    "des_dth_fd_resps",
+    "des_fw_l1_reqs",
+    "des_ml_buf_info_q",
+    "des_ml_load_info_q",
+]
+
+SER_PARAM_VALUES = [
+    "ser_field_handlers",
+    "ser_cr_rocc_commands",
+    "ser_dth_hasbits_reqs",
+    "ser_dth_descriptor_reqs",
+    "ser_dth_reg_resps",
+    "ser_dth_reqs_meta",
+    "ser_dth_fh_outputs",
+    "ser_mw_write_input",
+    "ser_mw_write_inject",
+    "ser_mw_write_ptrs",
+]
 
 
-@dataclass(frozen=True)
-class HyperParams:
-    learning_rate: float
-    batch_size: int
-    epochs: int
+def load_dataset(dataset_path: str) -> pd.DataFrame:
+    return pd.read_csv(dataset_path)
 
 
-DEFAULT_HPARAMS = HyperParams(
-    learning_rate=1e-3,
-    batch_size=64,
-    epochs=1000,
-)
+def pre_process_dataset(dataset: pd.DataFrame, side: str) -> pd.DataFrame:
+    side_name = SIDE_TO_NAME[side]
 
+    if "op" not in dataset.columns:
+        raise ValueError("Input CSV is missing required column 'op'.")
 
-def load_numpy_dataset(features_path: str, labels_path: str) -> TensorDataset:
-    features = torch.from_numpy(np.load(features_path)).float()
-    labels = torch.from_numpy(np.load(labels_path)).float()
-    return TensorDataset(features, labels)
+    side_df = dataset[dataset["op"] == side].copy()
+    if side_df.empty:
+        raise ValueError(f"No rows found for side '{side_name}' (op={side!r}).")
+
+    if LABEL_COLUMN in side_df.columns:
+        label_column = LABEL_COLUMN
+    elif FALLBACK_LABEL_COLUMN in side_df.columns:
+        # Backward-compatible fallback if the dataset still stores bytes/s.
+        side_df[LABEL_COLUMN] = side_df[FALLBACK_LABEL_COLUMN] * (8.0 / 1e9)
+        label_column = LABEL_COLUMN
+    else:
+        raise ValueError(
+            f"Input CSV is missing '{LABEL_COLUMN}' (or fallback '{FALLBACK_LABEL_COLUMN}')."
+        )
+
+    side_param_values = DES_PARAM_VALUES if side == "des" else SER_PARAM_VALUES
+    missing_param_columns = [col for col in side_param_values if col not in side_df.columns]
+    if missing_param_columns:
+        raise ValueError(
+            f"Input CSV is missing expected {side_name} config columns: {missing_param_columns}"
+        )
+
+    knob_columns = list(side_param_values)
+    analytical_columns = [col for col in side_df.columns if col.startswith(FEATURE_PREFIX)]
+    feature_columns = knob_columns + analytical_columns
+    if not feature_columns:
+        raise ValueError(
+            f"No feature columns detected for side '{side_name}'. "
+            f"Expected config columns from {side_name} params and/or '{FEATURE_PREFIX}'."
+        )
+
+    pruned = side_df.dropna(subset=feature_columns + [label_column]).copy()
+    model_df = pruned[feature_columns + [label_column]].copy()
+    return model_df.astype(float)
 
 
 def train_epoch(model: nn.Module, loader: DataLoader, loss_fn: nn.Module, optimizer: optim.Optimizer, device: str) -> float:
@@ -48,7 +101,6 @@ def train_epoch(model: nn.Module, loader: DataLoader, loss_fn: nn.Module, optimi
     total_loss = 0.0
     num_batches = 0
     for inputs, targets in loader:
-        inputs = inputs.view(inputs.size(0), -1)
         inputs = inputs.to(device)
         targets = targets.to(device)
         optimizer.zero_grad()
@@ -59,7 +111,7 @@ def train_epoch(model: nn.Module, loader: DataLoader, loss_fn: nn.Module, optimi
         torch_xla.sync()
         total_loss += loss.item()
         num_batches += 1
-    return float(total_loss / max(num_batches, 1))
+    return total_loss / max(num_batches, 1)
 
 
 def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device: str) -> tuple[float, float]:
@@ -67,18 +119,19 @@ def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device:
     total_loss = 0.0
     total_percent_error = 0.0
     num_batches = 0
+
     with torch.no_grad():
         for inputs, targets in loader:
-            inputs = inputs.view(inputs.size(0), -1)
             inputs = inputs.to(device)
             targets = targets.to(device)
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             torch_xla.sync()
             total_loss += loss.item()
-            # Compute mean absolute percent error for this batch; avoid div-by-zero with eps.
             eps = 1e-8
-            batch_percent_error = ((torch.abs(outputs - targets) / (torch.abs(targets) + eps)).mean() * 100.0)
+            batch_percent_error = (
+                (torch.abs(outputs - targets) / (torch.abs(targets) + eps)).mean() * 100.0
+            )
             total_percent_error += batch_percent_error.item()
             num_batches += 1
 
@@ -91,111 +144,143 @@ def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the Lynx ML model using PyTorch and XLA with the AWS Neuron SDK.")
     parser.add_argument(
-        "--data-dir",
-        default="data",
-        help="Path to folder containing 'deserializer_dataset' and 'serializer_dataset' folders.",
+        "-d",
+        "--dataset-path",
+        default="data/training_data.csv",
+        help="Path to enriched CSV produced by build_training_dataset.py",
+    )
+    parser.add_argument(
+        "--side",
+        choices=["des", "ser"],
+        default="des",
+        help="Which side to train on: des or ser.",
+    )
+    parser.add_argument(
+        "--test-size",
+        default=0.25,
+        type=float,
+        help="Fraction of the dataset to use for testing",
     )
     parser.add_argument(
         "-o",
         "--output-dir",
-        default="training_results",
         help="Output directory for checkpoint and metrics files",
+        default="training_results",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    hyperparams = DEFAULT_HPARAMS
+    side_name = SIDE_TO_NAME[args.side]
 
-    for dataset_type in ["deserializer", "serializer"]:
-        dataset_dir = os.path.join(args.data_dir, dataset_type + "_dataset")
+    print(f"Loading dataset from {args.dataset_path}")
+    dataset = load_dataset(args.dataset_path)
+    print(f"Dataset size: {dataset.shape[0]}")
 
-        train_features_path = os.path.join(dataset_dir, "train_features.npy")
-        train_labels_path = os.path.join(dataset_dir, "train_labels.npy")
-        test_features_path = os.path.join(dataset_dir, "test_features.npy")
-        test_labels_path = os.path.join(dataset_dir, "test_labels.npy")
+    model_df = pre_process_dataset(dataset, args.side)
+    train_df, test_df = train_test_split(
+        model_df,
+        test_size=args.test_size,
+        random_state=42,
+    )
+    train_features = train_df.drop(columns=[LABEL_COLUMN])
+    train_labels = train_df[LABEL_COLUMN]
+    test_features = test_df.drop(columns=[LABEL_COLUMN])
+    test_labels = test_df[LABEL_COLUMN]
+    print(
+        f"Final split: {len(train_features)} train, {len(test_features)} test "
+        f"({len(test_features)/(len(train_features)+len(test_features)):.2%} test)"
+    )
+    print(f"Train dataset shape: {train_features.shape}")
+    print(f"Test dataset shape: {test_features.shape}")
 
-        # Load raw numpy arrays
-        train_features_np = np.load(train_features_path)
-        train_labels_np = np.load(train_labels_path)
-        test_features_np = np.load(test_features_path)
-        test_labels_np = np.load(test_labels_path)
+    scaler = StandardScaler()
+    train_features = train_features.copy().astype(float)
+    test_features = test_features.copy().astype(float)
+    train_features[train_features.columns] = scaler.fit_transform(train_features[train_features.columns])
+    test_features[train_features.columns] = scaler.transform(test_features[train_features.columns])
 
-        # Standardize features with a shared scaler (fit on train)
-        scaler = StandardScaler()
-        train_features_np = scaler.fit_transform(train_features_np)
-        test_features_np = scaler.transform(test_features_np)
+    train_features_t = torch.from_numpy(train_features.to_numpy(copy=True)).float()
+    train_labels_t = torch.from_numpy(train_labels.to_numpy(copy=True)).float().unsqueeze(1)
+    test_features_t = torch.from_numpy(test_features.to_numpy(copy=True)).float()
+    test_labels_t = torch.from_numpy(test_labels.to_numpy(copy=True)).float().unsqueeze(1)
 
-        # Convert to tensors and datasets
-        train_features_t = torch.from_numpy(train_features_np).float()
-        train_labels_t = torch.from_numpy(train_labels_np).float()
-        test_features_t = torch.from_numpy(test_features_np).float()
-        test_labels_t = torch.from_numpy(test_labels_np).float()
+    train_ds = TensorDataset(train_features_t, train_labels_t)
+    test_ds = TensorDataset(test_features_t, test_labels_t)
+    train_loader = DataLoader(train_ds, batch_size=512, shuffle=True)
+    test_loader = DataLoader(test_ds, batch_size=512, shuffle=False)
 
-        train_ds = TensorDataset(train_features_t, train_labels_t)
-        test_ds = TensorDataset(test_features_t, test_labels_t)
+    device = "xla"
+    epochs = 200
+    model = LynxMLModel(input_size=train_features.shape[1], hidden_dims=[256, 128], output_size=1).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=0.001)
+    loss_fn = nn.L1Loss()
 
-        train_size = len(train_ds)
-        test_size = len(test_ds)
-        batch_size = hyperparams.batch_size
-        input_size = train_features_t.shape[1]
+    early_stop_patience = 10
+    best_eval_loss = float("inf")
+    epochs_without_improvement = 0
 
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-        test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+    print("----------- Start Training --------------")
+    epochs_data: list[dict[str, float]] = []
+    total_start = time.perf_counter()
+    for epoch in range(1, epochs + 1):
+        epoch_start = time.perf_counter()
+        train_loss = train_epoch(model, train_loader, loss_fn, optimizer, device)
+        eval_loss, percent_error = evaluate(model, test_loader, loss_fn, device)
+        epoch_duration = time.perf_counter() - epoch_start
+        epochs_data.append(
+            {
+                "duration": epoch_duration,
+                "train_loss": float(train_loss),
+                "eval_loss": float(eval_loss),
+                "percent_error": float(percent_error),
+            }
+        )
+        print(
+            f"Epoch {epoch:02d} | "
+            f"Train Loss: {train_loss:.4f} | "
+            f"Eval Loss: {eval_loss:.4f} | "
+            f"Percent Error: {percent_error:.2f}% | "
+            f"Time: {epoch_duration:.2f}s"
+        )
 
-        device = "xla"
+        if eval_loss < best_eval_loss:
+            best_eval_loss = eval_loss
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= early_stop_patience:
+                print(f"Early stopping: no improvement for {early_stop_patience} epochs.")
+                break
 
-        model = LynxMLModel(input_size=input_size, hidden_dims=(64, 32, 16), output_size=1).to(device)
-        optimizer = optim.Adam(model.parameters(), lr=hyperparams.learning_rate)
-        loss_fn = nn.L1Loss()
+    print("------------ End Training ---------------")
+    total_duration = time.perf_counter() - total_start
 
-        print('----------- Start Training --------------')
-        print(f"HyperParams: {asdict(hyperparams)}")
-        epochs_data: list[dict[str, float]] = []
-        total_start = time.perf_counter()
-        for epoch in range(1, hyperparams.epochs + 1):
-            epoch_start = time.perf_counter()
-            train_loss = train_epoch(model, train_loader, loss_fn, optimizer, device)
-            eval_loss, percent_error = evaluate(model, test_loader, loss_fn, device)
-            epoch_duration = time.perf_counter() - epoch_start
-            epochs_data.append(
-                {
-                    "duration": epoch_duration,
-                    "train_loss": float(train_loss),
-                    "eval_loss": float(eval_loss),
-                    "percent_error": float(percent_error),
-                }
-            )
-            print(
-                f"Epoch {epoch:02d} | "
-                f"Train Loss: {train_loss:.4f} | "
-                f"Eval Loss: {eval_loss:.4f} | "
-                f"Percent Error: {percent_error:.2f}% | "
-                f"Time: {epoch_duration:.2f}s"
-            )
-        print('------------ End Training ---------------')
-        total_duration = time.perf_counter() - total_start
+    os.makedirs(args.output_dir, exist_ok=True)
 
-        os.makedirs(args.output_dir, exist_ok=True)
-        checkpoint_path = os.path.join(args.output_dir, f"{dataset_type}_checkpoint.pt")
-        checkpoint = {'state_dict': model.state_dict()}
-        xm.save(checkpoint, checkpoint_path)
+    checkpoint_path = os.path.join(args.output_dir, f"{side_name}_checkpoint.pt")
+    checkpoint = {"state_dict": model.state_dict()}
+    xm.save(checkpoint, checkpoint_path)
 
-        # Persist preprocessing artifacts so inference can reproduce training transforms.
-        scaler_path = os.path.join(args.output_dir, f"{dataset_type}_scaler.joblib")
-        joblib.dump(scaler, scaler_path)
+    scaler_path = os.path.join(args.output_dir, f"{side_name}_scaler.joblib")
+    joblib.dump(scaler, scaler_path)
 
-        metrics_path = os.path.join(args.output_dir, f"{dataset_type}_metrics.json")
-        with open(metrics_path, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "total_duration": total_duration,
-                    "epochs": epochs_data,
-                },
-                f,
-                indent=2,
-            )
+    metrics_path = os.path.join(args.output_dir, f"{side_name}_metrics.json")
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "dataset_path": args.dataset_path,
+                "side": args.side,
+                "side_name": side_name,
+                "test_size": args.test_size,
+                "num_features": int(train_features.shape[1]),
+                "total_duration": total_duration,
+                "epochs": epochs_data,
+            },
+            f,
+            indent=2,
+        )
 
 
 if __name__ == "__main__":
