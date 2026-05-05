@@ -6,7 +6,7 @@
 |-------------------------|---------|
 | `HyperProtoBench/`      | Google's HyperProtoBench source (`.proto` schemas + `.inc` runtime data). |
 | `analytical_model/`     | Protobuf schema analyzer → feature vectors. See `analytical_model/README.md`. Supports `--verilator-bench-profile` to match what the Verilator-simulated benches actually exercise. |
-| `build_training_dataset.py` | Joins Verilator sweep results (one CSV from `hyperscale-grpc-chipyard/.../verilator-bench/run_sweep.sh`) with the analytical-feature vector per bench, producing a training CSV plus optional `X.npy` / `y.npy` tensors for `ml_model/train.py`. |
+| `build_training_dataset.py` | Joins Verilator sweep results (one CSV from Chipyard `generators/protoacc/software/verilator-bench/run_sweep.sh`) with the analytical-feature vector per bench, producing serializer/deserializer `.npy` datasets under `ml_model/data/` for `ml_model/train.py`. |
 | `ml_model/`             | PyTorch training code. Reads `X.npy` / `y.npy`. |
 | `sample_protoacc_model/`| Older end-to-end sample built against placeholder throughput data. |
 
@@ -34,18 +34,20 @@
 
 ## Quick start: produce a training dataset for one benchmark
 
-Assumes Chipyard is set up at `/home/ec2-user/hyperscale-grpc-chipyard` and
-the Verilator sim + bench ELFs have been built
-(see `hyperscale-grpc-chipyard/generators/protoacc/software/verilator-bench/STATUS.md`).
+Assumes a Chipyard checkout with `generators/protoacc/software/verilator-bench`
+(this repo is normally the **`software/lynx`** submodule next to that directory).
+Set `CHIPYARD_ROOT` to your Chipyard tree if scripts cannot infer it. Build the
+Verilator sim + bench ELFs first (see `verilator-bench/STATUS.md`).
 
 ```bash
 # 1. Refresh analytical features (bench-scoped, so they match the Verilator benches):
-cd /home/ec2-user/lynx/analytical_model
+cd analytical_model
 python3 protobuf_analyzer.py --verilator-bench-profile \
     --output protobuf_analysis_verilator_bench.json
 python3 extract_features.py \
     --input protobuf_analysis_verilator_bench.json \
     --output extracted_features.json
+cd ..
 
 # 2. Generate + simulate a sweep across the ProtoAcc hardware parameter space.
 #    Defaults: all 6 benches × both ops (op is matched to each config's side),
@@ -53,22 +55,20 @@ python3 extract_features.py \
 #    The run appends one row per (config, bench, op) to the CSV; re-running
 #    resumes at the first missing row. Scope with --bench/--benches/--op/--side
 #    for a smaller smoke test.
-python3 /home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/gen_protoacc_sweep_configs.py \
+python3 "${CHIPYARD_ROOT}/generators/protoacc/software/verilator-bench/gen_protoacc_sweep_configs.py" \
     --emit both -t random -n 32 -s 42
-bash /home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/verilator-bench/run_sweep.sh \
+bash "${CHIPYARD_ROOT}/generators/protoacc/software/verilator-bench/run_sweep.sh" \
     --output /tmp/sweep.csv
 
 # 3. Join sweep results with analytical features:
-python3 /home/ec2-user/lynx/build_training_dataset.py \
+python3 build_training_dataset.py \
     --sweep-csv /tmp/sweep.csv \
-    --output    /tmp/training.csv \
-    --npy-dir   /tmp/training_npy
+    --output-base-dir ./ml_model/data
 
-# 4. Train (example):
-cd /home/ec2-user/lynx/ml_model
-python3 train.py \
-    --features /tmp/training_npy/X.npy \
-    --labels   /tmp/training_npy/y.npy
+# 4. Train (example): paths depend on how ml_model/load_data expects tensors —
+#    see ml_model/README.md or train.py --help.
+cd ml_model
+python3 train.py --help
 ```
 
 ## Training CSV schema

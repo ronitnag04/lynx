@@ -4,14 +4,12 @@ build_training_dataset.py — join Verilator sweep results with protobuf
 analytical features into per-side training datasets for the Lynx ML model.
 
 Inputs:
-  --sweep-csv CSV      From
-                       /home/ec2-user/hyperscale-grpc-chipyard/generators/
-                       protoacc/software/verilator-bench/run_sweep.sh — one row
-                       per (hw_config x bench x op) with cycle/byte/throughput
-                       and the hardware parameter knobs. Rows are tagged with
-                       op=ser|des; this script splits by op.
-  --features JSON      Default
-                       /home/ec2-user/lynx/analytical_model/extracted_features.json
+  --sweep-csv CSV      From Chipyard's
+                       generators/protoacc/software/verilator-bench/run_sweep.sh
+                       — one row per (hw_config x bench x op) with cycle/byte/
+                       throughput and the hardware parameter knobs. Rows are
+                       tagged with op=ser|des; this script splits by op.
+  --features JSON      Default: <lynx-repo>/analytical_model/extracted_features.json
                        (produced by analytical_model/extract_features.py).
                        Keyed on bench name (``bench0``..``bench5``).
 
@@ -33,7 +31,7 @@ Feature layout (per row, matching the sample generator):
 Typical usage:
   python3 build_training_dataset.py \\
       --sweep-csv /tmp/combined_sweep.csv \\
-      --output-base-dir /home/ec2-user/lynx/ml_model/data
+      --output-base-dir ./ml_model/data
 """
 
 from __future__ import annotations
@@ -47,9 +45,9 @@ from typing import Any, Dict, List, Tuple
 import pandas as pd
 import numpy as np
 
-
-DEFAULT_FEATURES = Path("/home/ec2-user/lynx/analytical_model/extracted_features.json")
-DEFAULT_OUTPUT_BASE = Path("/home/ec2-user/lynx/ml_model/data")
+_LYNX_REPO_ROOT = Path(__file__).resolve().parent
+DEFAULT_FEATURES = _LYNX_REPO_ROOT / "analytical_model" / "extracted_features.json"
+DEFAULT_OUTPUT_BASE = _LYNX_REPO_ROOT / "ml_model" / "data"
 
 # Feature keys we know about (keep in sync with analytical_model/extract_features.py).
 SCALAR_FEATURES = [
