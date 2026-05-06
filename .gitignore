@@ -29,3 +29,7 @@ ml_model/**/*.jsonl
 # Ignore datasets in ml_model
 ml_model/data/
 ml_model/sim_results/
+
+# Ignore training results in ml_model
+ml_model/results/
+ml_model/sweep_results/

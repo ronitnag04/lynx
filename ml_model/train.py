@@ -57,18 +57,15 @@ def load_dataset(dataset_path: str) -> pd.DataFrame:
 def pre_process_dataset(dataset: pd.DataFrame, side: str) -> pd.DataFrame:
     side_name = SIDE_TO_NAME[side]
 
-    if "op" not in dataset.columns:
-        raise ValueError("Input CSV is missing required column 'op'.")
+    if dataset.empty:
+        raise ValueError(f"Dataset is empty for side '{side_name}'.")
 
-    side_df = dataset[dataset["op"] == side].copy()
-    if side_df.empty:
-        raise ValueError(f"No rows found for side '{side_name}' (op={side!r}).")
-
-    if LABEL_COLUMN in side_df.columns:
+    if LABEL_COLUMN in dataset.columns:
         label_column = LABEL_COLUMN
-    elif FALLBACK_LABEL_COLUMN in side_df.columns:
+    elif FALLBACK_LABEL_COLUMN in dataset.columns:
         # Backward-compatible fallback if the dataset still stores bytes/s.
-        side_df[LABEL_COLUMN] = side_df[FALLBACK_LABEL_COLUMN] * (8.0 / 1e9)
+        dataset = dataset.copy()
+        dataset[LABEL_COLUMN] = dataset[FALLBACK_LABEL_COLUMN] * (8.0 / 1e9)
         label_column = LABEL_COLUMN
     else:
         raise ValueError(
@@ -76,14 +73,14 @@ def pre_process_dataset(dataset: pd.DataFrame, side: str) -> pd.DataFrame:
         )
 
     side_param_values = DES_PARAM_VALUES if side == "des" else SER_PARAM_VALUES
-    missing_param_columns = [col for col in side_param_values if col not in side_df.columns]
+    missing_param_columns = [col for col in side_param_values if col not in dataset.columns]
     if missing_param_columns:
         raise ValueError(
             f"Input CSV is missing expected {side_name} config columns: {missing_param_columns}"
         )
 
     knob_columns = list(side_param_values)
-    analytical_columns = [col for col in side_df.columns if col.startswith(FEATURE_PREFIX)]
+    analytical_columns = [col for col in dataset.columns if col.startswith(FEATURE_PREFIX)]
     feature_columns = knob_columns + analytical_columns
     if not feature_columns:
         raise ValueError(
@@ -91,9 +88,15 @@ def pre_process_dataset(dataset: pd.DataFrame, side: str) -> pd.DataFrame:
             f"Expected config columns from {side_name} params and/or '{FEATURE_PREFIX}'."
         )
 
-    pruned = side_df.dropna(subset=feature_columns + [label_column]).copy()
+    pruned = dataset.dropna(subset=feature_columns + [label_column]).copy()
     model_df = pruned[feature_columns + [label_column]].copy()
     return model_df.astype(float)
+
+
+def split_features_and_labels(model_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    features = model_df.drop(columns=[LABEL_COLUMN])
+    labels = model_df[LABEL_COLUMN]
+    return features, labels
 
 
 def train_epoch(model: nn.Module, loader: DataLoader, loss_fn: nn.Module, optimizer: optim.Optimizer, device: str) -> float:
@@ -162,6 +165,17 @@ def parse_args() -> argparse.Namespace:
         help="Fraction of the dataset to use for testing",
     )
     parser.add_argument(
+        "--ood-benchmark",
+        type=str,
+        help="OOD benchmark to use for testing",
+    )
+    parser.add_argument(
+        "--ood-train-size",
+        type=int,
+        help="Number of OOD data points to use in training set",
+        default=0,
+    )
+    parser.add_argument(
         "-o",
         "--output-dir",
         help="Output directory for checkpoint and metrics files",
@@ -178,16 +192,30 @@ def main() -> None:
     dataset = load_dataset(args.dataset_path)
     print(f"Dataset size: {dataset.shape[0]}")
 
-    model_df = pre_process_dataset(dataset, args.side)
-    train_df, test_df = train_test_split(
-        model_df,
-        test_size=args.test_size,
-        random_state=42,
-    )
-    train_features = train_df.drop(columns=[LABEL_COLUMN])
-    train_labels = train_df[LABEL_COLUMN]
-    test_features = test_df.drop(columns=[LABEL_COLUMN])
-    test_labels = test_df[LABEL_COLUMN]
+    if "op" not in dataset.columns:
+        raise ValueError("Input CSV is missing required column 'op'.")
+    side_dataset = dataset[dataset["op"] == args.side].copy()
+    if side_dataset.empty:
+        raise ValueError(f"No rows found for side '{side_name}' (op={args.side!r}).")
+
+    if args.ood_benchmark:
+        test_df = side_dataset[side_dataset["bench"] == args.ood_benchmark]
+        train_df = side_dataset[side_dataset["bench"] != args.ood_benchmark]
+        if args.ood_train_size > 0:
+            ood_train_df = test_df.sample(args.ood_train_size, random_state=42)
+            train_df = pd.concat([train_df, ood_train_df])
+            test_df = test_df.drop(ood_train_df.index)
+    else:
+        train_df, test_df = train_test_split(
+            side_dataset,
+            test_size=args.test_size,
+            random_state=42,
+        )
+
+    train_df = pre_process_dataset(train_df, args.side)
+    test_df = pre_process_dataset(test_df, args.side)
+    train_features, train_labels = split_features_and_labels(train_df)
+    test_features, test_labels = split_features_and_labels(test_df)
     print(
         f"Final split: {len(train_features)} train, {len(test_features)} test "
         f"({len(test_features)/(len(train_features)+len(test_features)):.2%} test)"
