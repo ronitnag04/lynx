@@ -155,7 +155,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--side",
         choices=["des", "ser"],
-        default="des",
+        required=True,
         help="Which side to train on: des or ser.",
     )
     parser.add_argument(
@@ -180,6 +180,11 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         help="Output directory for checkpoint and metrics files",
         default="training_results",
+    )
+    parser.add_argument(
+        "--add-final-predictions",
+        action="store_true",
+        help="Write a CSV with actual/predicted throughput plus config_name and bench for the final test split.",
     )
     return parser.parse_args()
 
@@ -287,12 +292,48 @@ def main() -> None:
 
     os.makedirs(args.output_dir, exist_ok=True)
 
+    args_path = os.path.join(args.output_dir, f"{side_name}_input_args.txt")
+    with open(args_path, "w", encoding="utf-8") as f:
+        for key in sorted(vars(args)):
+            f.write(f"{key}={getattr(args, key)}\n")
+
     checkpoint_path = os.path.join(args.output_dir, f"{side_name}_checkpoint.pt")
     checkpoint = {"state_dict": model.state_dict()}
     xm.save(checkpoint, checkpoint_path)
 
     scaler_path = os.path.join(args.output_dir, f"{side_name}_scaler.joblib")
     joblib.dump(scaler, scaler_path)
+
+    final_predictions_duration = None
+
+    if args.add_final_predictions:
+        final_predictions_start = time.perf_counter()
+        full_df = pre_process_dataset(side_dataset, args.side)
+        full_features, full_labels = split_features_and_labels(full_df)
+        full_features = full_features.copy().astype(float)
+        full_features[train_features.columns] = scaler.transform(full_features[train_features.columns])
+
+        config_name_values = side_dataset.loc[full_df.index, "config_name"].to_numpy(copy=True)
+        bench_values = side_dataset.loc[full_df.index, "bench"].to_numpy(copy=True)
+
+        model.eval()
+        with torch.no_grad():
+            full_inputs = torch.from_numpy(full_features.to_numpy(copy=True)).float().to(device)
+            predictions = model(full_inputs).detach().cpu().squeeze(1).numpy()
+            torch_xla.sync()
+
+        final_predictions_df = pd.DataFrame(
+            {
+                "config_name": config_name_values,
+                "bench": bench_values,
+                "actual_throughput": full_labels.to_numpy(copy=True),
+                "predicted_throughput": predictions,
+            }
+        )
+        predictions_path = os.path.join(args.output_dir, f"{side_name}_final_predictions.csv")
+        final_predictions_df.to_csv(predictions_path, index=False)
+        final_predictions_duration = time.perf_counter() - final_predictions_start
+        print(f"Final predictions time: {final_predictions_duration:.2f}s")
 
     metrics_path = os.path.join(args.output_dir, f"{side_name}_metrics.json")
     with open(metrics_path, "w", encoding="utf-8") as f:
@@ -304,6 +345,7 @@ def main() -> None:
                 "test_size": args.test_size,
                 "num_features": int(train_features.shape[1]),
                 "total_duration": total_duration,
+                "final_predictions_duration": final_predictions_duration,
                 "epochs": epochs_data,
             },
             f,
