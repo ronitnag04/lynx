@@ -182,6 +182,11 @@ def parse_args() -> argparse.Namespace:
         default="training_results",
     )
     parser.add_argument(
+        "--train-only",
+        action="store_true",
+        help="Use the full dataset for training only (no validation split or eval in the training loop).",
+    )
+    parser.add_argument(
         "--add-final-predictions",
         action="store_true",
         help="Write a CSV with actual/predicted throughput plus config_name and bench for the final test split.",
@@ -203,46 +208,60 @@ def main() -> None:
     if side_dataset.empty:
         raise ValueError(f"No rows found for side '{side_name}' (op={args.side!r}).")
 
-    if args.ood_benchmark:
-        test_df = side_dataset[side_dataset["bench"] == args.ood_benchmark]
-        train_df = side_dataset[side_dataset["bench"] != args.ood_benchmark]
-        if args.ood_train_size > 0:
-            ood_train_df = test_df.sample(args.ood_train_size, random_state=42)
-            train_df = pd.concat([train_df, ood_train_df])
-            test_df = test_df.drop(ood_train_df.index)
+    if args.train_only:
+        train_df = side_dataset
+        test_df = None
     else:
-        train_df, test_df = train_test_split(
-            side_dataset,
-            test_size=args.test_size,
-            random_state=42,
-        )
+        if args.ood_benchmark:
+            test_df = side_dataset[side_dataset["bench"] == args.ood_benchmark]
+            train_df = side_dataset[side_dataset["bench"] != args.ood_benchmark]
+            if args.ood_train_size > 0:
+                ood_train_df = test_df.sample(args.ood_train_size, random_state=42)
+                train_df = pd.concat([train_df, ood_train_df])
+                test_df = test_df.drop(ood_train_df.index)
+        else:
+            train_df, test_df = train_test_split(
+                side_dataset,
+                test_size=args.test_size,
+                random_state=42,
+            )
 
     train_df = pre_process_dataset(train_df, args.side)
-    test_df = pre_process_dataset(test_df, args.side)
     train_features, train_labels = split_features_and_labels(train_df)
-    test_features, test_labels = split_features_and_labels(test_df)
-    print(
-        f"Final split: {len(train_features)} train, {len(test_features)} test "
-        f"({len(test_features)/(len(train_features)+len(test_features)):.2%} test)"
-    )
-    print(f"Train dataset shape: {train_features.shape}")
-    print(f"Test dataset shape: {test_features.shape}")
+
+    if args.train_only:
+        print(f"Train-only mode: using {len(train_features)} samples for training, no validation split.")
+        test_df = None
+        test_features = None
+        test_labels = None
+    else:
+        test_df = pre_process_dataset(test_df, args.side)
+        test_features, test_labels = split_features_and_labels(test_df)
+        print(
+            f"Final split: {len(train_features)} train, {len(test_features)} test "
+            f"({len(test_features)/(len(train_features)+len(test_features)):.2%} test)"
+        )
+        print(f"Train dataset shape: {train_features.shape}")
+        print(f"Test dataset shape: {test_features.shape}")
 
     scaler = StandardScaler()
     train_features = train_features.copy().astype(float)
-    test_features = test_features.copy().astype(float)
     train_features[train_features.columns] = scaler.fit_transform(train_features[train_features.columns])
-    test_features[train_features.columns] = scaler.transform(test_features[train_features.columns])
+
+    if args.train_only:
+        test_loader = None
+    else:
+        test_features = test_features.copy().astype(float)
+        test_features[train_features.columns] = scaler.transform(test_features[train_features.columns])
+        test_features_t = torch.from_numpy(test_features.to_numpy(copy=True)).float()
+        test_labels_t = torch.from_numpy(test_labels.to_numpy(copy=True)).float().unsqueeze(1)
+        test_ds = TensorDataset(test_features_t, test_labels_t)
+        test_loader = DataLoader(test_ds, batch_size=512, shuffle=False)
 
     train_features_t = torch.from_numpy(train_features.to_numpy(copy=True)).float()
     train_labels_t = torch.from_numpy(train_labels.to_numpy(copy=True)).float().unsqueeze(1)
-    test_features_t = torch.from_numpy(test_features.to_numpy(copy=True)).float()
-    test_labels_t = torch.from_numpy(test_labels.to_numpy(copy=True)).float().unsqueeze(1)
-
     train_ds = TensorDataset(train_features_t, train_labels_t)
-    test_ds = TensorDataset(test_features_t, test_labels_t)
     train_loader = DataLoader(train_ds, batch_size=512, shuffle=True)
-    test_loader = DataLoader(test_ds, batch_size=512, shuffle=False)
 
     device = "xla"
     epochs = 200
@@ -257,35 +276,53 @@ def main() -> None:
     print("----------- Start Training --------------")
     epochs_data: list[dict[str, float]] = []
     total_start = time.perf_counter()
-    for epoch in range(1, epochs + 1):
-        epoch_start = time.perf_counter()
-        train_loss = train_epoch(model, train_loader, loss_fn, optimizer, device)
-        eval_loss, percent_error = evaluate(model, test_loader, loss_fn, device)
-        epoch_duration = time.perf_counter() - epoch_start
-        epochs_data.append(
-            {
-                "duration": epoch_duration,
-                "train_loss": float(train_loss),
-                "eval_loss": float(eval_loss),
-                "percent_error": float(percent_error),
-            }
-        )
-        print(
-            f"Epoch {epoch:02d} | "
-            f"Train Loss: {train_loss:.4f} | "
-            f"Eval Loss: {eval_loss:.4f} | "
-            f"Percent Error: {percent_error:.2f}% | "
-            f"Time: {epoch_duration:.2f}s"
-        )
 
-        if eval_loss < best_eval_loss:
-            best_eval_loss = eval_loss
-            epochs_without_improvement = 0
-        else:
-            epochs_without_improvement += 1
-            if epochs_without_improvement >= early_stop_patience:
-                print(f"Early stopping: no improvement for {early_stop_patience} epochs.")
-                break
+    if args.train_only:
+        for epoch in range(1, epochs + 1):
+            epoch_start = time.perf_counter()
+            train_loss = train_epoch(model, train_loader, loss_fn, optimizer, device)
+            epoch_duration = time.perf_counter() - epoch_start
+            epochs_data.append(
+                {
+                    "duration": epoch_duration,
+                    "train_loss": float(train_loss),
+                }
+            )
+            print(
+                f"Epoch {epoch:02d} | "
+                f"Train Loss: {train_loss:.4f} | "
+                f"Time: {epoch_duration:.2f}s"
+            )
+    else:
+        for epoch in range(1, epochs + 1):
+            epoch_start = time.perf_counter()
+            train_loss = train_epoch(model, train_loader, loss_fn, optimizer, device)
+            eval_loss, percent_error = evaluate(model, test_loader, loss_fn, device)
+            epoch_duration = time.perf_counter() - epoch_start
+            epochs_data.append(
+                {
+                    "duration": epoch_duration,
+                    "train_loss": float(train_loss),
+                    "eval_loss": float(eval_loss),
+                    "percent_error": float(percent_error),
+                }
+            )
+            print(
+                f"Epoch {epoch:02d} | "
+                f"Train Loss: {train_loss:.4f} | "
+                f"Eval Loss: {eval_loss:.4f} | "
+                f"Percent Error: {percent_error:.2f}% | "
+                f"Time: {epoch_duration:.2f}s"
+            )
+
+            if eval_loss < best_eval_loss:
+                best_eval_loss = eval_loss
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= early_stop_patience:
+                    print(f"Early stopping: no improvement for {early_stop_patience} epochs.")
+                    break
 
     print("------------ End Training ---------------")
     total_duration = time.perf_counter() - total_start
@@ -305,6 +342,7 @@ def main() -> None:
     joblib.dump(scaler, scaler_path)
 
     final_predictions_duration = None
+    final_predictions_percent_error = None
 
     if args.add_final_predictions:
         final_predictions_start = time.perf_counter()
@@ -332,8 +370,17 @@ def main() -> None:
         )
         predictions_path = os.path.join(args.output_dir, f"{side_name}_final_predictions.csv")
         final_predictions_df.to_csv(predictions_path, index=False)
+        eps = 1e-8
+        final_predictions_percent_error = float(
+            (
+                (final_predictions_df["predicted_throughput"] - final_predictions_df["actual_throughput"]).abs()
+                / (final_predictions_df["actual_throughput"].abs() + eps)
+            ).mean()
+            * 100.0
+        )
         final_predictions_duration = time.perf_counter() - final_predictions_start
         print(f"Final predictions time: {final_predictions_duration:.2f}s")
+        print(f"Final predictions percent error: {final_predictions_percent_error:.2f}%")
 
     metrics_path = os.path.join(args.output_dir, f"{side_name}_metrics.json")
     with open(metrics_path, "w", encoding="utf-8") as f:
@@ -346,6 +393,7 @@ def main() -> None:
                 "num_features": int(train_features.shape[1]),
                 "total_duration": total_duration,
                 "final_predictions_duration": final_predictions_duration,
+                "final_predictions_percent_error": final_predictions_percent_error,
                 "epochs": epochs_data,
             },
             f,
