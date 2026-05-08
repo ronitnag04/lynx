@@ -78,6 +78,69 @@ python3 extract_features.py --input protobuf_analysis_verilator_bench.json \
     --output extracted_features.json
 ```
 
+## Synthetic-bench analyzer (`analyze_synth.py`)
+
+`protobuf_analyzer.analyze_hyperprotobench()` is tightly coupled to HPB's
+`benchmark.inc` format — it regex-parses `<Msg>_Set_F1(...)` bodies whose
+field-name regex stops at underscore, so it won't consume fleetbench's
+`access_message<N>.cc` files (`set_f_0(...)` etc.). Rather than patch the HPB
+path, `analyze_synth.py` is a sibling that:
+
+1. Reuses `ProtobufAnalyzer` to parse each synthetic bench's `benchmark.proto`
+   (produced by `verilator-bench/gen_synth_proto.py` — a concatenation of 5
+   random fleetbench `Message<N>.proto` schemas). All structural features
+   (`depth`, `total_fields`, `nested_message_count`) come from that shared
+   parser, so synth and HPB rows are directly comparable.
+2. Reads the sibling `runtime_lengths.json` (emitted by `fleetbench_runtime.py`
+   when the synth bench is generated) and uses the median observed length
+   per string/bytes field as that field's representative size.
+3. Applies the same `WorkloadProfile` caps as the HPB side
+   (`max_string_len=1024`, `max_nested_depth=5`, `skip_repeated=True`) so the
+   `serialized_size_bytes` for a synth message reflects what `proto_to_accel.py`
+   actually emits into the Verilator bench's cpp_obj layout.
+4. Merges its results into an existing
+   `protobuf_analysis_verilator_bench.json`, so running the HPB analyzer
+   first and then `analyze_synth.py` yields one combined JSON that
+   `extract_features.py` consumes without modification.
+
+```bash
+# HPB benches 0-5 (writes bench0..bench5 entries):
+python3 protobuf_analyzer.py --verilator-bench-profile \
+    --output protobuf_analysis_verilator_bench.json
+
+# Synthetic benches 6+ (appends bench6..bench<N> entries in place):
+python3 analyze_synth.py \
+    --synth-root ../../verilator-bench/gen/synth \
+    --in-json protobuf_analysis_verilator_bench.json \
+    --out-json protobuf_analysis_verilator_bench.json
+
+# Extract feature vectors for every bench in the merged JSON:
+python3 extract_features.py \
+    --input protobuf_analysis_verilator_bench.json \
+    --output extracted_features.json
+```
+
+### Known caveats
+
+- **Size is a median, not a sample.** `proto_to_accel.py` samples a random
+  length per string occurrence; `analyze_synth.py` uses the median of the
+  observed distribution. `total_size_bytes` is therefore a close proxy for
+  the measured wire bytes, not an exact match. Same order of fidelity as the
+  HPB analyzer (which also estimates from `.inc`).
+- **Schema depth is unclipped.** `max_depth` reports the raw protobuf
+  nesting depth (17 is common for fleetbench), while serialized size respects
+  the 5-depth cap. This is intentional so the ML model sees "how ambitious
+  the schema is" separately from "how much of it hits the pipe" — but if
+  `max_depth` dominates feature importance, consider clipping it at the
+  profile's cap before training.
+- **Simple-name collisions.** When a synth bench combines two fleetbench
+  `Message<K>` schemas that both have a nested `M1`, their runtime-length
+  observations are merged and the first `M1` seen during the walk wins for
+  sizing purposes. Since any realistic-looking length distribution works for
+  string sampling, this is benign — but it means the `runtime_lengths.json`
+  in the synth bench dir is the authoritative audit trail if you ever need
+  to trace which Message<K> contributed which observation.
+
 #### Output Format
 
 The tool generates two types of output:

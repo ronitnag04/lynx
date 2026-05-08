@@ -1,3 +1,6 @@
 [submodule "HyperProtoBench"]
 	path = HyperProtoBench
 	url = https://github.com/google/HyperProtoBench.git
+[submodule "fleetbench"]
+	path = fleetbench
+	url = https://github.com/google/fleetbench.git
