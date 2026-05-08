@@ -1,55 +1,34 @@
 #!/usr/bin/env python3
 """
-Pareto-optimal hardware configuration search for Lynx ProtoAccel.
+Exhaustive hardware configuration search for Lynx ProtoAccel.
 
-This optimizer mirrors the staged search style used in Peregrine's
-`optimize_hw_config.py`, but uses benchmark-level extracted features from
-`analytical_model/extracted_features.json` (not ronamol traces).
-
-Objectives:
-  1) Maximize predicted throughput (modeled as minimizing -throughput).
-  2) Minimize a ProtoAccel hardware cost proxy derived from Scala sources.
-
-Staged flow vs Peregrine (four conceptual stages):
-
-  Stage 1 (Peregrine): constraint pruning over encoded configs. We skip this
-  for Lynx: the ProtoAccel sweep grid has no separate structural validity
-  predicate (every knob combination is instantiated in Chisel).
-
-  Stage 2 (Peregrine): Latin Hypercube global sampling. We do this as our
-  first numerical stage (labeled "Stage 2" in logs to match Peregrine).
-
-  Stage 3 (Peregrine): NSGA-II refinement. Same here.
-
-  Stage 4 (Peregrine): archive merge, strict Pareto extraction, optional
-  per-parameter sensitivity, validation-candidate flagging, JSON output.
-  Sensitivity can be skipped with ``--skip-sensitivity``.
+This mirrors the output + reporting style of `optimize_hw_config.py`, but instead
+of sampling/refining (LHS + NSGA-II), it evaluates the entire discrete hardware
+parameter grid and returns the strict Pareto front.
 """
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
 import joblib
-import numpy as np
 import torch
-from scipy.stats import qmc
-from sklearn.preprocessing import StandardScaler
-
-from pymoo.algorithms.moo.nsga2 import NSGA2
-from pymoo.core.problem import Problem
-from pymoo.operators.crossover.sbx import SBX
-from pymoo.operators.mutation.pm import PM
-from pymoo.optimize import minimize
-from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
-
 from model import LynxMLModel
-from util import hardware_cost, SIDE_TO_NAME, SER_PARAM_COLUMNS, DES_PARAM_COLUMNS, PARAM_VALUES_BY_SIDE, DEFAULT_CONFIG_BY_SIDE
+
+import numpy as np
+
+from util import (
+    DEFAULT_CONFIG_BY_SIDE,
+    DES_PARAM_COLUMNS,
+    PARAM_VALUES_BY_SIDE,
+    SER_PARAM_COLUMNS,
+    SIDE_TO_NAME,
+    hardware_cost,
+)
 
 
 def default_config(side: str) -> dict[str, int]:
@@ -58,15 +37,6 @@ def default_config(side: str) -> dict[str, int]:
 
 def get_param_values(side: str) -> dict[str, list[int]]:
     return PARAM_VALUES_BY_SIDE[side]
-
-
-def load_model(checkpoint_path: Path, input_size: int, device: str) -> LynxMLModel:
-    ck = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    model = LynxMLModel(input_size=input_size, hidden_dims=[256, 128], output_size=1)
-    model.load_state_dict(ck["state_dict"])
-    model.to(device)
-    model.eval()
-    return model
 
 
 def flatten_extracted_features(bench_features: dict[str, Any]) -> dict[str, float]:
@@ -82,17 +52,47 @@ def flatten_extracted_features(bench_features: dict[str, Any]) -> dict[str, floa
 
 def load_benchmark_feature_rows(features_path: Path) -> list[dict[str, float]]:
     raw = json.loads(features_path.read_text())
-    rows = []
+    rows: list[dict[str, float]] = []
     for bench_name, feats in raw.items():
         r = flatten_extracted_features(feats)
-        r["bench_name"] = bench_name
+        r["bench_name"] = bench_name  # debug/traceability; not used in model features
         rows.append(r)
     return rows
 
 
-# ---------------------------------------------------------------------------
-# Config encoding / search space
-# ---------------------------------------------------------------------------
+def load_model(checkpoint_path: Path, input_size: int, device: str) -> Any:
+    ck = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    # Keep architecture identical to training/optimizer.
+    model = LynxMLModel(input_size=input_size, hidden_dims=[256, 128], output_size=1)
+    model.load_state_dict(ck["state_dict"])
+    model.to(device)
+    model.eval()
+    return model
+
+
+def cartesian_product_indices(sizes: np.ndarray) -> np.ndarray:
+    """Return all index combinations for per-dimension sizes.
+
+    Produces an array of shape (prod(sizes), len(sizes)) with dtype int64.
+    This implementation avoids `np.meshgrid`'s large intermediate tensors.
+    """
+    sizes = np.asarray(sizes, dtype=np.int64)
+    if sizes.size == 0:
+        return np.empty((0, 0), dtype=np.int64)
+    if np.any(sizes <= 0):
+        raise ValueError(f"All sizes must be >0; got {sizes.tolist()}")
+
+    n = int(np.prod(sizes, dtype=np.int64))
+    d = int(sizes.size)
+    out = np.empty((n, d), dtype=np.int64)
+    stride = 1
+    for j in range(d - 1, -1, -1):
+        v = np.arange(int(sizes[j]), dtype=np.int64)
+        reps = n // (int(sizes[j]) * stride)
+        col = np.tile(np.repeat(v, stride), reps)
+        out[:, j] = col
+        stride *= int(sizes[j])
+    return out
 
 
 @dataclass
@@ -126,16 +126,11 @@ class SearchSpace:
         return cfgs
 
 
-# ---------------------------------------------------------------------------
-# Feature assembly (extracted features + hardware knobs, scaled like training)
-# ---------------------------------------------------------------------------
-
-
 class FeatureBuilder:
     def __init__(
         self,
         side: str,
-        scaler: StandardScaler,
+        scaler: Any,
         space: SearchSpace,
         benchmark_rows: list[dict[str, float]],
     ) -> None:
@@ -184,15 +179,10 @@ class FeatureBuilder:
         return out
 
 
-# ---------------------------------------------------------------------------
-# Model + batched objective evaluation
-# ---------------------------------------------------------------------------
-
-
 def evaluate_indices(
     indices: np.ndarray,
     side: str,
-    model: LynxMLModel,
+    model: Any,
     builder: FeatureBuilder,
     device: str,
     batch_size: int,
@@ -209,65 +199,95 @@ def evaluate_indices(
             preds[i:j] = y
     mean_tp = preds.reshape(indices.shape[0], builder.n_benchmarks).mean(axis=1).astype(np.float64)
     costs = hardware_cost(builder.space.decode_indices(indices), side=side)
+    # Objective 0: minimize (-throughput) to maximize throughput.
     return np.stack([-mean_tp, costs], axis=1)
 
 
-# ---------------------------------------------------------------------------
-# Stage 2: Latin Hypercube global sampling
-# ---------------------------------------------------------------------------
+def evaluate_all_indices(
+    all_idx: np.ndarray,
+    side: str,
+    model: Any,
+    builder: FeatureBuilder,
+    device: str,
+    inference_batch_size: int,
+    cfg_chunk_size: int,
+) -> np.ndarray:
+    if all_idx.shape[0] == 0:
+        return np.empty((0, 2), dtype=np.float64)
 
-
-def dedup_rows(x: np.ndarray) -> np.ndarray:
-    if x.shape[0] == 0:
-        return x
-    return np.unique(x, axis=0)
-
-
-def lhs_sample(space: SearchSpace, n_samples: int, rng: np.random.Generator) -> np.ndarray:
-    sampler = qmc.LatinHypercube(d=len(space.search_param_order), seed=rng)
-    u = sampler.random(n_samples)
-    idx = np.floor(u * space.param_n_values).astype(np.int64)
-    return np.minimum(idx, space.param_n_values - 1)
-
-
-# ---------------------------------------------------------------------------
-# Stage 3: NSGA-II
-# ---------------------------------------------------------------------------
-
-
-class HWConfigProblem(Problem):
-    def __init__(self, space: SearchSpace, eval_fn: Any) -> None:
-        super().__init__(
-            n_var=len(space.search_param_order),
-            n_obj=2,
-            xl=np.zeros(len(space.search_param_order), dtype=float),
-            xu=(space.param_n_values - 1).astype(float),
-            vtype=int,
+    f = np.empty((all_idx.shape[0], 2), dtype=np.float64)
+    for i in range(0, all_idx.shape[0], cfg_chunk_size):
+        j = min(i + cfg_chunk_size, all_idx.shape[0])
+        f[i:j] = evaluate_indices(
+            all_idx[i:j], side, model, builder, device, inference_batch_size
         )
-        self._eval_fn = eval_fn
-        self.archive_X: list[np.ndarray] = []
-        self.archive_F: list[np.ndarray] = []
-
-    def _evaluate(self, X: np.ndarray, out: dict[str, Any], *args: Any, **kwargs: Any) -> None:
-        xi = np.round(X).astype(np.int64)
-        f = self._eval_fn(xi)
-        out["F"] = f
-        self.archive_X.append(xi.copy())
-        self.archive_F.append(f.copy())
+    return f
 
 
-# ---------------------------------------------------------------------------
-# Stage 4: Pareto extraction, sensitivity, validation flagging, output
-# ---------------------------------------------------------------------------
+def flag_validation_candidates(pareto_f: np.ndarray, k: int) -> np.ndarray:
+    n = len(pareto_f)
+    flags = np.zeros(n, dtype=bool)
+    if n == 0:
+        return flags
+    flags[int(np.argmin(pareto_f[:, 0]))] = True  # throughput optimum (max tp)
+    flags[int(np.argmin(pareto_f[:, 1]))] = True  # cost optimum
+    n_extra = max(0, k - 2)
+    if n_extra > 0 and n >= 2:
+        order = np.argsort(pareto_f[:, 1])
+        pos = np.linspace(0, n - 1, n_extra + 2)[1:-1].astype(int)
+        for p in pos:
+            flags[int(order[p])] = True
+    return flags
+
+
+def strict_pareto_front_2d_min(f: np.ndarray) -> np.ndarray:
+    """Strict nondominated set for 2D minimization.
+
+    Returns indices (into f) of the nondominated points.
+    """
+    if f.shape[0] == 0:
+        return np.empty((0,), dtype=np.int64)
+
+    # Sort by (f0 asc, f1 asc). Using stable sort helps keep equal keys contiguous.
+    idx = np.lexsort((f[:, 1], f[:, 0]))
+    f_sorted = f[idx]
+
+    keep_sorted_pos = np.zeros(f_sorted.shape[0], dtype=bool)
+    best_f1 = np.inf  # best (minimum) f1 among *previous* f0 groups
+
+    start = 0
+    n = f_sorted.shape[0]
+    while start < n:
+        f0_val = f_sorted[start, 0]
+        end = start + 1
+        while end < n and f_sorted[end, 0] == f0_val:
+            end += 1
+
+        # f1 is also sorted ascending within the group; the minimum is at 'start'.
+        group_min_f1 = float(f_sorted[start, 1])
+        if group_min_f1 < best_f1:
+            # Keep all points in this f0-group that achieve the min f1.
+            m = start + 1
+            while m < end and float(f_sorted[m, 1]) == group_min_f1:
+                m += 1
+            keep_sorted_pos[start:m] = True
+            best_f1 = group_min_f1
+
+        start = end
+
+    return idx[keep_sorted_pos]
 
 
 def final_pareto(archive_x: np.ndarray, archive_f: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    if archive_x.shape[0] == 0:
+        return archive_x, archive_f
+    # Ensure unique configurations first (matches optimizer behavior).
     _, keep = np.unique(archive_x, axis=0, return_index=True)
     keep.sort()
     x = archive_x[keep]
     f = archive_f[keep]
-    rows = NonDominatedSorting().do(f, only_non_dominated_front=True)
-    return x[rows], f[rows]
+    pareto_idx = strict_pareto_front_2d_min(f)
+    return x[pareto_idx], f[pareto_idx]
 
 
 def compute_sensitivity(
@@ -275,13 +295,12 @@ def compute_sensitivity(
     pareto_F: np.ndarray,
     space: SearchSpace,
     side: str,
-    model: LynxMLModel,
+    model: Any,
     builder: FeatureBuilder,
     device: str,
     batch_size: int,
 ) -> list[dict[str, dict[str, float]]]:
-    """Per Pareto point, for each parameter, try index ±1 and report worst |Δ| in
-    throughput and cost (Lynx has no extra feasibility predicate beyond grid bounds)."""
+    """Per Pareto point, for each parameter, try index ±1 and report worst |Δ|."""
     if pareto_X.size == 0:
         return []
 
@@ -329,25 +348,11 @@ def compute_sensitivity(
     return reduced
 
 
-def flag_validation_candidates(pareto_f: np.ndarray, k: int) -> np.ndarray:
-    n = len(pareto_f)
-    flags = np.zeros(n, dtype=bool)
-    if n == 0:
-        return flags
-    flags[int(np.argmin(pareto_f[:, 0]))] = True  # throughput optimum (max tp)
-    flags[int(np.argmin(pareto_f[:, 1]))] = True  # cost optimum
-    n_extra = max(0, k - 2)
-    if n_extra > 0 and n >= 2:
-        order = np.argsort(pareto_f[:, 1])
-        pos = np.linspace(0, n - 1, n_extra + 2)[1:-1].astype(int)
-        for p in pos:
-            flags[int(order[p])] = True
-    return flags
-
-
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Pareto-optimal Lynx hardware configuration search.")
-    p.add_argument("--side", choices=["ser", "des"], required=True, help="Optimize serializer or deserializer.")
+    p = argparse.ArgumentParser(
+        description="Exhaustively evaluate all Lynx hardware configurations and extract the Pareto front."
+    )
+    p.add_argument("--side", choices=["ser", "des"], required=True, help="Search serializer or deserializer.")
     p.add_argument(
         "--checkpoint-dir",
         type=Path,
@@ -360,25 +365,28 @@ def parse_args() -> argparse.Namespace:
         default=Path("../analytical_model/extracted_features.json"),
         help="Path to extracted_features.json.",
     )
-    p.add_argument("--output", type=Path, default=Path("pareto_front.json"), help="Output JSON path.")
-    p.add_argument("--lhs-samples", type=int, default=64*1024, help="Number of LHS samples for Stage 1.")
-    p.add_argument("--near-pareto-frac", type=float, default=0.05, help="Fraction retained for NSGA seed.")
-    p.add_argument("--nsga-pop-size", type=int, default=256, help="NSGA-II population size.")
-    p.add_argument("--nsga-generations", type=int, default=80, help="NSGA-II generations.")
-    p.add_argument("--batch-size", type=int, default=1024, help="Inference batch size.")
+    p.add_argument("--output", type=Path, default=Path("pareto_front_exhaustive.json"), help="Output JSON path.")
+    p.add_argument("--batch-size", type=int, default=1024, help="Inference batch size (rows of feature tensor).")
+    p.add_argument(
+        "--cfg-chunk-size",
+        type=int,
+        default=4096,
+        help="How many configs to evaluate per chunk (memory bound).",
+    )
     p.add_argument("--validation-k", type=int, default=8, help="Validation candidate count.")
     p.add_argument(
         "--skip-sensitivity",
         action="store_true",
-        help="Skip per-parameter ±1 index sensitivity on the final Pareto front (Stage 4).",
+        help="Skip per-parameter ±1 index sensitivity on the final Pareto front.",
     )
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--device", type=str, default="cpu", help="Torch device.")
     p.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Suppress per-generation NSGA-II progress from pymoo (same as Peregrine).",
+        "--limit-configs",
+        type=int,
+        default=0,
+        help="If >0, only evaluate the first N configs (debug). Default evaluates all.",
     )
+    p.add_argument("--seed", type=int, default=42, help="Seed used only for reproducible debug limiting.")
+    p.add_argument("--device", type=str, default="cpu", help="Torch device.")
     return p.parse_args()
 
 
@@ -396,14 +404,10 @@ def main() -> None:
     param_values = get_param_values(args.side)
     space = SearchSpace.from_param_values(param_values)
 
-    scaler: StandardScaler = joblib.load(scl)
+    scaler = joblib.load(scl)
     benches = load_benchmark_feature_rows(args.features_file)
     builder = FeatureBuilder(args.side, scaler, space, benches)
     model = load_model(ckpt, input_size=builder.n_features, device=args.device)
-
-    # -------------------------------------------------------------------------
-    # Stage 1: (skipped) — Peregrine prunes invalid configs; Lynx grid is all valid.
-    # -------------------------------------------------------------------------
 
     baseline_cfg = default_config(args.side)
     t0 = time.perf_counter()
@@ -418,60 +422,35 @@ def main() -> None:
         f"cost={baseline_cost:.2f} ({time.perf_counter() - t0:.2f}s)"
     )
 
-    # -------------------------------------------------------------------------
-    # Stage 2: Latin Hypercube global sampling + seed pool for NSGA-II
-    # -------------------------------------------------------------------------
-    print(f"[Stage 2] LHS {args.lhs_samples} samples over {len(space.search_param_order)} params")
-    x1 = lhs_sample(space, args.lhs_samples, rng)
-    x1 = dedup_rows(x1)
-    f1 = evaluate_indices(x1, args.side, model, builder, args.device, args.batch_size)
-    nds = NonDominatedSorting()
-    front_rows = nds.do(f1, only_non_dominated_front=True)
-    n_seed = max(len(front_rows), int(len(x1) * args.near_pareto_frac))
-    seed = x1[np.argsort(f1[:, 0])[:n_seed]].astype(float)
-    print(f"[Stage 2] unique={len(x1)} pareto={len(front_rows)} seed={len(seed)}")
-
-    # -------------------------------------------------------------------------
-    # Stage 3: NSGA-II refinement
-    # -------------------------------------------------------------------------
-    print(f"[Stage 3] NSGA-II pop={args.nsga_pop_size}, gen={args.nsga_generations}")
-    if len(seed) < args.nsga_pop_size:
-        extra = lhs_sample(space, args.nsga_pop_size - len(seed), rng).astype(float)
-        seed = np.concatenate([seed, extra], axis=0)
-    elif len(seed) > args.nsga_pop_size:
-        choose = rng.choice(len(seed), size=args.nsga_pop_size, replace=False)
-        seed = seed[choose]
-
-    problem = HWConfigProblem(
-        space=space,
-        eval_fn=lambda xi: evaluate_indices(xi, args.side, model, builder, args.device, args.batch_size),
-    )
-    algo = NSGA2(
-        pop_size=args.nsga_pop_size,
-        sampling=seed,
-        crossover=SBX(prob=0.9, eta=15, vtype=float),
-        mutation=PM(prob=1.0 / len(space.search_param_order), eta=20, vtype=float),
-        eliminate_duplicates=True,
-    )
-    # pymoo prints a table each generation (n_gen, n_eval, n_nds, …) when verbose=True;
-    # n_nds tracks the nondominated set in the current population — i.e. Pareto-front size.
-    minimize(
-        problem,
-        algo,
-        ("n_gen", args.nsga_generations),
-        seed=int(rng.integers(0, 2**31 - 1)),
-        verbose=not args.quiet,
+    t_enum = time.perf_counter()
+    all_idx = cartesian_product_indices(space.param_n_values)
+    total = int(all_idx.shape[0])
+    print(
+        f"Enumerated {total} configs over {len(space.search_param_order)} params "
+        f"({time.perf_counter() - t_enum:.2f}s)"
     )
 
-    x2 = np.concatenate(problem.archive_X, axis=0) if problem.archive_X else np.empty((0, len(space.search_param_order)), dtype=np.int64)
-    full_x = dedup_rows(np.concatenate([x1, x2], axis=0))
-    full_f = evaluate_indices(full_x, args.side, model, builder, args.device, args.batch_size)
+    if args.limit_configs and args.limit_configs > 0:
+        n = min(int(args.limit_configs), total)
+        choose = rng.choice(total, size=n, replace=False)
+        choose.sort()
+        all_idx = all_idx[choose]
+        print(f"Debug limit enabled: evaluating {len(all_idx)} / {total} configs")
 
-    # -------------------------------------------------------------------------
-    # Stage 4: final Pareto extraction, sensitivity, validation flagging, output
-    # -------------------------------------------------------------------------
+    t_eval = time.perf_counter()
+    all_f = evaluate_all_indices(
+        all_idx,
+        args.side,
+        model,
+        builder,
+        args.device,
+        args.batch_size,
+        args.cfg_chunk_size,
+    )
+    print(f"Evaluated {len(all_idx)} configs ({time.perf_counter() - t_eval:.2f}s)")
+
     stage4_t0 = time.perf_counter()
-    pareto_x, pareto_f = final_pareto(full_x, full_f)
+    pareto_x, pareto_f = final_pareto(all_idx, all_f)
     order = np.argsort(pareto_f[:, 1])
     pareto_x = pareto_x[order]
     pareto_f = pareto_f[order]
@@ -480,17 +459,17 @@ def main() -> None:
         sensitivities: list[dict[str, dict[str, float]]] = [{} for _ in range(len(pareto_x))]
     else:
         t_s = time.perf_counter()
-        print("[Stage 4] Computing per-parameter sensitivity")
+        print("Computing per-parameter sensitivity")
         sensitivities = compute_sensitivity(
             pareto_x, pareto_f, space, args.side, model, builder, args.device, args.batch_size
         )
-        print(f"[Stage 4] Sensitivity computed in {time.perf_counter() - t_s:.2f}s")
+        print(f"Sensitivity computed in {time.perf_counter() - t_s:.2f}s")
 
     flags = flag_validation_candidates(pareto_f, args.validation_k)
     cfgs = space.decode_indices(pareto_x)
-    print(f"[Stage 4] Total: {time.perf_counter() - stage4_t0:.2f}s")
+    print(f"Pareto extraction + output prep: {time.perf_counter() - stage4_t0:.2f}s")
 
-    front: list[dict[str, Any]] = []
+    front: list[dict[str, object]] = []
     for i, cfg in enumerate(cfgs):
         front.append(
             {
@@ -512,11 +491,13 @@ def main() -> None:
         },
         "pareto_front": front,
         "stats": {
-            "lhs_samples": int(args.lhs_samples),
-            "lhs_unique": int(len(x1)),
-            "archive_total": int(len(full_x)),
+            "search": "exhaustive",
+            "grid_total_configs": int(total),
+            "evaluated_configs": int(len(all_idx)),
             "n_pareto_final": int(len(front)),
             "n_validation_candidates": int(int(flags.sum())),
+            "cfg_chunk_size": int(args.cfg_chunk_size),
+            "inference_batch_size": int(args.batch_size),
             "total_duration_s": round(time.perf_counter() - t_total, 2),
         },
     }
