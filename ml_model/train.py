@@ -23,6 +23,7 @@ LABEL_COLUMN = "throughput_gbits_per_sec"
 FALLBACK_LABEL_COLUMN = "throughput_bytes_per_sec"
 FEATURE_PREFIX = "feat_"
 SIDE_TO_NAME = {"des": "deserializer", "ser": "serializer"}
+XLA_MIN_TRAIN_ROWS = 30
 
 DES_PARAM_VALUES = [
     "des_top_descriptor_reqs",
@@ -54,7 +55,12 @@ def load_dataset(dataset_path: str) -> pd.DataFrame:
     return pd.read_csv(dataset_path)
 
 
-def pre_process_dataset(dataset: pd.DataFrame, side: str, one_hot_bmark: bool) -> pd.DataFrame:
+def pre_process_dataset(
+    dataset: pd.DataFrame,
+    side: str,
+    one_hot_bmark: bool,
+    benchmark_categories: Iterable[str] | None = None,
+) -> pd.DataFrame:
     side_name = SIDE_TO_NAME[side]
 
     if dataset.empty:
@@ -83,6 +89,11 @@ def pre_process_dataset(dataset: pd.DataFrame, side: str, one_hot_bmark: bool) -
 
     if one_hot_bmark:
         bmark_column = "bench"
+        if benchmark_categories is not None:
+            dataset = dataset.copy()
+            dataset[bmark_column] = pd.Categorical(
+                dataset[bmark_column], categories=list(benchmark_categories)
+            )
         bmark_one_hot = pd.get_dummies(dataset[bmark_column])
         dataset = pd.concat([dataset, bmark_one_hot], axis=1)
         dataset = dataset.drop(columns=[bmark_column])
@@ -130,7 +141,8 @@ def write_predictions_csv(
     with torch.no_grad():
         inputs = torch.from_numpy(features.to_numpy(copy=True)).float().to(device)
         predictions = model(inputs).detach().cpu().squeeze(1).numpy()
-        torch_xla.sync()
+        if device == "xla":
+            torch_xla.sync()
 
     predictions_df = pd.DataFrame(
         {
@@ -167,7 +179,8 @@ def train_epoch(model: nn.Module, loader: DataLoader, loss_fn: nn.Module, optimi
         loss = loss_fn(outputs, targets)
         loss.backward()
         optimizer.step()
-        torch_xla.sync()
+        if device == "xla":
+            torch_xla.sync()
         total_loss += loss.item()
         num_batches += 1
     return total_loss / max(num_batches, 1)
@@ -185,7 +198,8 @@ def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device:
             targets = targets.to(device)
             outputs = model(inputs)
             loss = criterion(outputs, targets)
-            torch_xla.sync()
+            if device == "xla":
+                torch_xla.sync()
             total_loss += loss.item()
             eps = 1e-8
             batch_percent_error = (
@@ -267,7 +281,41 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Don't use features, only one-hot encode the benchmark",
     )
+    parser.add_argument(
+        "--device",
+        choices=["auto", "xla", "cpu"],
+        default="auto",
+        help="Device backend to use. 'auto' prefers XLA unless training rows are <= 30.",
+    )
     return parser.parse_args()
+
+
+def resolve_device(args: argparse.Namespace, num_train_rows: int, num_test_rows: int | None = None) -> str:
+    if args.device == "cpu":
+        print("Using CPU backend (--device=cpu).")
+        return "cpu"
+
+    if args.device == "xla":
+        print("Using XLA backend (--device=xla).")
+        return "xla"
+
+    # Auto mode: use CPU for tiny train/test sets, otherwise XLA.
+    if num_train_rows <= XLA_MIN_TRAIN_ROWS:
+        print(
+            f"Training rows ({num_train_rows}) <= {XLA_MIN_TRAIN_ROWS}; "
+            "using CPU backend."
+        )
+        return "cpu"
+
+    if num_test_rows is not None and num_test_rows <= XLA_MIN_TRAIN_ROWS:
+        print(
+            f"Test rows ({num_test_rows}) <= {XLA_MIN_TRAIN_ROWS}; "
+            "using CPU backend."
+        )
+        return "cpu"
+
+    print("Using XLA backend (--device=auto).")
+    return "xla"
 
 
 def main() -> None:
@@ -288,6 +336,10 @@ def main() -> None:
         side_dataset = side_dataset[~side_dataset["bench"].isin([f"bench{i}" for i in range(6)])]
         if side_dataset.empty:
             raise ValueError(f"No rows found for side '{side_name}' after filtering out HPB benchmarks for synth-only mode.")
+
+    benchmark_categories = None
+    if args.one_hot_bmark:
+        benchmark_categories = sorted(side_dataset["bench"].dropna().unique().tolist())
 
     if args.train_only:
         train_df = side_dataset
@@ -312,7 +364,9 @@ def main() -> None:
                 random_state=42,
             )
 
-    train_df = pre_process_dataset(train_df, args.side, args.one_hot_bmark)
+    train_df = pre_process_dataset(
+        train_df, args.side, args.one_hot_bmark, benchmark_categories=benchmark_categories
+    )
     train_features, train_labels = split_features_and_labels(train_df)
 
     if args.train_only:
@@ -321,7 +375,9 @@ def main() -> None:
         test_features = None
         test_labels = None
     else:
-        test_df = pre_process_dataset(test_df, args.side, args.one_hot_bmark)
+        test_df = pre_process_dataset(
+            test_df, args.side, args.one_hot_bmark, benchmark_categories=benchmark_categories
+        )
         test_features, test_labels = split_features_and_labels(test_df)
         print(
             f"Final split: {len(train_features)} train, {len(test_features)} test "
@@ -352,7 +408,8 @@ def main() -> None:
     train_ds = TensorDataset(train_features_t, train_labels_t)
     train_loader = DataLoader(train_ds, batch_size=512, shuffle=True)
 
-    device = "xla"
+    num_test_rows = None if args.train_only else len(test_features)
+    device = resolve_device(args, len(train_features), num_test_rows=num_test_rows)
     epochs = 500
     model = LynxMLModel(input_size=train_features.shape[1], hidden_dims=[256, 128], output_size=1).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=0.001)
@@ -425,7 +482,10 @@ def main() -> None:
 
     checkpoint_path = os.path.join(args.output_dir, f"{side_name}_checkpoint.pt")
     checkpoint = {"state_dict": model.state_dict()}
-    xm.save(checkpoint, checkpoint_path)
+    if device == "xla":
+        xm.save(checkpoint, checkpoint_path)
+    else:
+        torch.save(checkpoint, checkpoint_path)
 
     scaler_path = os.path.join(args.output_dir, f"{side_name}_scaler.joblib")
     joblib.dump(scaler, scaler_path)
@@ -436,7 +496,9 @@ def main() -> None:
     test_predictions_percent_error = None
 
     if args.add_full_predictions:
-        full_df = pre_process_dataset(side_dataset, args.side, args.one_hot_bmark)
+        full_df = pre_process_dataset(
+            side_dataset, args.side, args.one_hot_bmark, benchmark_categories=benchmark_categories
+        )
         full_predictions_duration, full_predictions_percent_error = write_predictions_csv(
             args.output_dir,
             side_name,
