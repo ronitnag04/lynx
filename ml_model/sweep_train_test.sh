@@ -13,6 +13,7 @@ PYTHON_SCRIPT="train.py"
 # Default: deserializer. Override: SIDE=ser ./sweep_train_test.sh
 SIDE="${SIDE:-des}"
 ONE_HOT_BMARK="${ONE_HOT_BMARK:-0}"
+NO_FEAT_DIST="${NO_FEAT_DIST:-0}"
 
 # Fractions passed directly to train.py --test-size.
 TEST_SIZES=(0.25 0.5 0.75 0.8 0.85 0.9 0.95 0.955 0.96 0.965 0.97 0.975 0.98 0.985 0.99)
@@ -52,9 +53,15 @@ for test_size in "${TEST_SIZES[@]}"; do
     else
         ONE_HOT_BMARK_FLAG=""
     fi
-
+    
+    if [ "$NO_FEAT_DIST" -eq 1 ]; then
+        NO_FEAT_DIST_FLAG="--no-feat-distributions"
+    else
+        NO_FEAT_DIST_FLAG=""
+    fi
+    
     if python "$PYTHON_SCRIPT" -d "$DATASET_PATH" --side "$SIDE" \
-        --test-size "$test_size" --output-dir "$OUTPUT_DIR" $ONE_HOT_BMARK_FLAG > "$RUN_DIR/training_output.txt" 2>&1; then
+        --test-size "$test_size" --output-dir "$OUTPUT_DIR" $ONE_HOT_BMARK_FLAG $NO_FEAT_DIST_FLAG > "$RUN_DIR/training_output.txt" 2>&1; then
         echo "✓ Completed: test_size=$test_size"
         echo "Test size: $test_size - COMPLETED at $(date)" >> "$SWEEP_LOG"
     else

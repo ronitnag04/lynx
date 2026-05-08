@@ -59,6 +59,7 @@ def pre_process_dataset(
     dataset: pd.DataFrame,
     side: str,
     one_hot_bmark: bool,
+    no_feat_distributions: bool = False,
     benchmark_categories: Iterable[str] | None = None,
 ) -> pd.DataFrame:
     side_name = SIDE_TO_NAME[side]
@@ -100,6 +101,12 @@ def pre_process_dataset(
         feature_columns = list(bmark_one_hot.columns) + knob_columns
     else:
         analytical_columns = [col for col in dataset.columns if col.startswith(FEATURE_PREFIX)]
+        if no_feat_distributions:
+            analytical_columns = [
+                col
+                for col in analytical_columns
+                if "_distribution_" not in col and "depth_counter_list_" not in col
+            ]
         feature_columns = analytical_columns + knob_columns
 
     if not feature_columns:
@@ -282,6 +289,11 @@ def parse_args() -> argparse.Namespace:
         help="Don't use features, only one-hot encode the benchmark",
     )
     parser.add_argument(
+        "--no-feat-distributions",
+        action="store_true",
+        help="Don't use distributions in the feature columns, only the min/max/avg and other feature columns",
+    )
+    parser.add_argument(
         "--device",
         choices=["auto", "xla", "cpu"],
         default="auto",
@@ -365,7 +377,11 @@ def main() -> None:
             )
 
     train_df = pre_process_dataset(
-        train_df, args.side, args.one_hot_bmark, benchmark_categories=benchmark_categories
+        train_df,
+        args.side,
+        args.one_hot_bmark,
+        no_feat_distributions=args.no_feat_distributions,
+        benchmark_categories=benchmark_categories,
     )
     train_features, train_labels = split_features_and_labels(train_df)
 
@@ -376,7 +392,11 @@ def main() -> None:
         test_labels = None
     else:
         test_df = pre_process_dataset(
-            test_df, args.side, args.one_hot_bmark, benchmark_categories=benchmark_categories
+            test_df,
+            args.side,
+            args.one_hot_bmark,
+            no_feat_distributions=args.no_feat_distributions,
+            benchmark_categories=benchmark_categories,
         )
         test_features, test_labels = split_features_and_labels(test_df)
         print(
@@ -497,7 +517,11 @@ def main() -> None:
 
     if args.add_full_predictions:
         full_df = pre_process_dataset(
-            side_dataset, args.side, args.one_hot_bmark, benchmark_categories=benchmark_categories
+            side_dataset,
+            args.side,
+            args.one_hot_bmark,
+            no_feat_distributions=args.no_feat_distributions,
+            benchmark_categories=benchmark_categories,
         )
         full_predictions_duration, full_predictions_percent_error = write_predictions_csv(
             args.output_dir,
