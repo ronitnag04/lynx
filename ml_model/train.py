@@ -54,7 +54,7 @@ def load_dataset(dataset_path: str) -> pd.DataFrame:
     return pd.read_csv(dataset_path)
 
 
-def pre_process_dataset(dataset: pd.DataFrame, side: str) -> pd.DataFrame:
+def pre_process_dataset(dataset: pd.DataFrame, side: str, one_hot_bmark: bool) -> pd.DataFrame:
     side_name = SIDE_TO_NAME[side]
 
     if dataset.empty:
@@ -80,8 +80,17 @@ def pre_process_dataset(dataset: pd.DataFrame, side: str) -> pd.DataFrame:
         )
 
     knob_columns = list(side_param_values)
-    analytical_columns = [col for col in dataset.columns if col.startswith(FEATURE_PREFIX)]
-    feature_columns = knob_columns + analytical_columns
+
+    if one_hot_bmark:
+        bmark_column = "bench"
+        bmark_one_hot = pd.get_dummies(dataset[bmark_column])
+        dataset = pd.concat([dataset, bmark_one_hot], axis=1)
+        dataset = dataset.drop(columns=[bmark_column])
+        feature_columns = list(bmark_one_hot.columns) + knob_columns
+    else:
+        analytical_columns = [col for col in dataset.columns if col.startswith(FEATURE_PREFIX)]
+        feature_columns = analytical_columns + knob_columns
+
     if not feature_columns:
         raise ValueError(
             f"No feature columns detected for side '{side_name}'. "
@@ -253,6 +262,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Write a CSV with actual/predicted throughput plus config_name and bench for the test dataset.",
     )
+    parser.add_argument(
+        "--one-hot-bmark",
+        action="store_true",
+        help="Don't use features, only one-hot encode the benchmark",
+    )
     return parser.parse_args()
 
 
@@ -298,7 +312,7 @@ def main() -> None:
                 random_state=42,
             )
 
-    train_df = pre_process_dataset(train_df, args.side)
+    train_df = pre_process_dataset(train_df, args.side, args.one_hot_bmark)
     train_features, train_labels = split_features_and_labels(train_df)
 
     if args.train_only:
@@ -307,7 +321,7 @@ def main() -> None:
         test_features = None
         test_labels = None
     else:
-        test_df = pre_process_dataset(test_df, args.side)
+        test_df = pre_process_dataset(test_df, args.side, args.one_hot_bmark)
         test_features, test_labels = split_features_and_labels(test_df)
         print(
             f"Final split: {len(train_features)} train, {len(test_features)} test "
@@ -315,6 +329,9 @@ def main() -> None:
         )
         print(f"Train dataset shape: {train_features.shape}")
         print(f"Test dataset shape: {test_features.shape}")
+
+    if args.one_hot_bmark:
+        print("WARNING: NO analytical model features are being used, using one-hot encoding benchmarks instead.")
 
     scaler = StandardScaler()
     train_features = train_features.copy().astype(float)
@@ -419,7 +436,7 @@ def main() -> None:
     test_predictions_percent_error = None
 
     if args.add_full_predictions:
-        full_df = pre_process_dataset(side_dataset, args.side)
+        full_df = pre_process_dataset(side_dataset, args.side, args.one_hot_bmark)
         full_predictions_duration, full_predictions_percent_error = write_predictions_csv(
             args.output_dir,
             side_name,
