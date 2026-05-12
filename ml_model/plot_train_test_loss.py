@@ -50,13 +50,12 @@ def plot_losses(
 
 
 def main() -> None:
-    base_dir = Path(__file__).resolve().parent
-    metrics_dir = base_dir / "training_results"
-    plots_dir = base_dir / "plots"
-    plots_dir.mkdir(parents=True, exist_ok=True)
 
-    serializer_path = metrics_dir / "serializer_metrics.json"
-    deserializer_path = metrics_dir / "deserializer_metrics.json"
+    serializer_dir = Path("results/hpb_verilator/serializer_test_0.25").absolute()
+    deserializer_dir = Path("results/hpb_verilator/deserializer_test_0.25").absolute()
+
+    serializer_path = Path(serializer_dir) / "serializer_metrics.json"
+    deserializer_path = Path(deserializer_dir) / "deserializer_metrics.json"
 
     plt.switch_backend("Agg")  # ensure headless execution is fine
 
@@ -67,8 +66,10 @@ def main() -> None:
         serializer_train,
         serializer_eval,
         title="Serializer Train vs Eval Loss",
-        output_path=plots_dir / "serializer_losses.png",
+        output_path=serializer_dir / "serializer_losses.png",
     )
+
+    print(f"Saved serializer loss plot to {serializer_dir / 'serializer_losses.png'}")
 
     deserializer_epochs, deserializer_train, deserializer_eval = load_losses(
         deserializer_path
@@ -78,10 +79,10 @@ def main() -> None:
         deserializer_train,
         deserializer_eval,
         title="Deserializer Train vs Eval Loss",
-        output_path=plots_dir / "deserializer_losses.png",
+        output_path=deserializer_dir / "deserializer_losses.png",
     )
 
-    print(f"Saved plots to {plots_dir}")
+    print(f"Saved deserializer loss plot to {deserializer_dir / 'deserializer_losses.png'}")
 
 
 if __name__ == "__main__":
