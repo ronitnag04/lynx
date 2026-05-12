@@ -103,33 +103,6 @@ class BenchmarkAnalysis:
     operation_statistics: Optional[Dict[str, int]] = None  # Operation type -> total count
 
 
-@dataclass
-class WorkloadProfile:
-    """Constraints that match the Verilator bench generator's workload scope.
-
-    Default (no-op profile) analyzes the full HyperProtoBench payloads. Setting
-    non-trivial values caps feature computation to match what the hardware
-    actually executes under our bare-metal bench, so the features line up with
-    the measured cycle/byte counts from /sims/verilator.
-
-    - max_string_len: cap per-field string/bytes payload length (bytes)
-    - max_nested_depth: messages at depth >= this get zero serialized size
-    - skip_repeated: treat repeated fields as if absent (zero size)
-    """
-    max_string_len: Optional[int] = None   # None = unlimited
-    max_nested_depth: Optional[int] = None # None = unlimited
-    skip_repeated: bool = False
-
-    @staticmethod
-    def verilator_bench_default() -> "WorkloadProfile":
-        """Mirrors the defaults baked into proto_to_accel.py."""
-        return WorkloadProfile(
-            max_string_len=1024,
-            max_nested_depth=5,
-            skip_repeated=True,
-        )
-
-
 class ProtobufAnalyzer:
     """Analyzes protobuf .proto files and extracts metadata"""
     
@@ -220,17 +193,13 @@ class ProtobufAnalyzer:
         'message': 'LEN',       # Wire type 2
     }
     
-    def __init__(self, proto_file_path: str, messages_to_analyze: Optional[List[str]] = None,
-                 workload_profile: Optional["WorkloadProfile"] = None):
+    def __init__(self, proto_file_path: str, messages_to_analyze: Optional[List[str]] = None):
         self.proto_file_path = proto_file_path
         self.content = self._read_file()
         self.syntax_version = self._extract_syntax()
         self.messages = []
         self.enums = []
         self.messages_to_analyze = messages_to_analyze  # Only analyze these messages
-        # Workload profile — caps applied during serialized-size calculation
-        # so features match what the Verilator bench actually exercises.
-        self.workload_profile = workload_profile or WorkloadProfile()
         # Paths to related files
         self.bench_dir = Path(proto_file_path).parent
         self.inc_file = self.bench_dir / 'benchmark.inc'
@@ -852,28 +821,19 @@ def get_message_for_var(var_name: str, var_to_message: Dict, message: Message, a
     return None
 
 
-def calculate_serialized_size_from_set_function(msg_name: str, set_function_body: str, message: Message, all_messages: Dict[str, Message],
-                                                  workload_profile: Optional[WorkloadProfile] = None) -> Tuple[int, Dict[str, int]]:
+def calculate_serialized_size_from_set_function(msg_name: str, set_function_body: str, message: Message, all_messages: Dict[str, Message]) -> Tuple[int, Dict[str, int]]:
     """Calculate serialized size from runtime Set_F1 function and update field sizes
-
+    
     Processes Set_F1 function line-by-line in a single pass:
     1. Track nested message variable assignments (e.g., M15::M17::M18* v11 = v9->mutable_f1();)
     2. Process set/add operations to determine sizes for variable-size fields from runtime values
     3. Update field.size_bytes directly in the message structure (for both top-level and nested messages)
     4. After processing, calculate nested message sizes and update parent field sizes
     5. Return total serialized size for the message (including nested messages) and nested message sizes
-
-    If ``workload_profile`` is provided, its caps are applied:
-      - repeated fields become zero-size (skipped entirely)
-      - string/bytes payloads are clamped to ``max_string_len``
-      - nested messages at depth >= ``max_nested_depth`` contribute 0
-    These mirror the Verilator bench generator's scope.
-
+    
     Returns:
         Tuple of (total_size, nested_message_sizes) where nested_message_sizes maps message names to their sizes
     """
-    if workload_profile is None:
-        workload_profile = WorkloadProfile()
     total_size = 0
     
     # Track variable assignments: var_name -> (message_path_list, target_message_name, field_name)
@@ -950,31 +910,23 @@ def calculate_serialized_size_from_set_function(msg_name: str, set_function_body
             
             # For repeated fields, track values separately (both set and add operations)
             if target_field.cardinality == 'repeated':
-                # Workload profile: our Verilator bench generator skips all
-                # repeated fields. Honor the same cap so features line up.
-                if workload_profile.skip_repeated:
-                    continue
                 key = (var_name, field_name)
                 if key not in repeated_field_values:
                     repeated_field_values[key] = []
                 # Store the line for later processing
                 repeated_field_values[key].append(line)
                 continue  # Process repeated fields in a separate pass
-
+            
             # Process non-repeated field: calculate size and update directly
             value_start = match.end()
             if value_start < len(line):
                 first_char = line[value_start]
-
+                
                 if first_char == '"' or first_char == "'":
                     # String/bytes value - calculate size from line length
                     line_len = len(line)
                     str_len = line_len - (value_start + 1) - 3  # +1 to skip opening quote, -3 for ");"
-                    # Apply Verilator bench's per-payload cap so the analytical
-                    # model reports sizes matching what the hardware saw.
-                    if workload_profile.max_string_len is not None:
-                        str_len = min(str_len, workload_profile.max_string_len)
-
+                    
                     # Set size for LEN fields from runtime values
                     # Per Protocol Buffers encoding: LEN = tag + length_varint + payload
                     if target_field.wire_type == 'LEN':
@@ -1157,8 +1109,6 @@ def calculate_serialized_size_from_set_function(msg_name: str, set_function_body
                         # Calculate string length: line length - opening quote position - 1 - 3 for ");"
                         line_len = len(value_line)
                         str_len = line_len - (quote_pos + 1) - 3  # +1 to skip opening quote, -3 for ");"
-                        if workload_profile.max_string_len is not None:
-                            str_len = min(str_len, workload_profile.max_string_len)
                         length_varint_size = ProtobufAnalyzer._calculate_varint_size(str_len)
                         total_size += tag_size + length_varint_size + str_len
                 elif target_field.field_type == 'message':
@@ -1194,22 +1144,6 @@ def calculate_serialized_size_from_set_function(msg_name: str, set_function_body
     
     # Calculate sizes for nested messages from deepest to shallowest
     for depth, var_name, nested_msg in nested_vars_by_depth:
-        # Workload profile: the Verilator bench does not instantiate
-        # submessages at depths >= max_nested_depth, so their contribution to
-        # the on-wire byte count is zero. We treat the same nested message as
-        # absent (size 0) to keep the analytical features aligned with what
-        # the hardware actually measured.
-        if (workload_profile.max_nested_depth is not None
-                and depth >= workload_profile.max_nested_depth):
-            nested_message_sizes[var_name] = 0
-            # Also mark the corresponding parent slot as zero-contribution so
-            # it doesn't accumulate below.
-            if var_name in var_to_field:
-                parent_msg, field_name = var_to_field[var_name]
-                parent_field = next((f for f in parent_msg.fields if f.name == field_name), None)
-                if parent_field and parent_field.is_nested_message:
-                    parent_field.size_bytes = 0
-            continue
         # Calculate the size of this nested message by summing its field sizes
         nested_size = 0
         for field in nested_msg.fields:
@@ -1301,18 +1235,10 @@ def print_message_details(msg: Message, indent: int = 0):
             print(f"{prefix}    {enum.get('name', 'Unknown')} with {len(enum.get('values', []))} values")
 
 
-def analyze_hyperprotobench(base_path: str,
-                             workload_profile: Optional[WorkloadProfile] = None) -> Dict:
-    """Analyze all benchmarks in HyperProtoBench directory.
-
-    ``workload_profile`` caps the serialized-size computation to match what
-    the Verilator bench actually exercises (see WorkloadProfile). Pass
-    ``WorkloadProfile.verilator_bench_default()`` to mirror our bench scope.
-    """
+def analyze_hyperprotobench(base_path: str) -> Dict:
+    """Analyze all benchmarks in HyperProtoBench directory"""
     base_path = Path(base_path)
     results = {}
-    if workload_profile is None:
-        workload_profile = WorkloadProfile()
     
     # Find all benchmark directories, skipping -ser and -deser versions
     bench_dirs = []
@@ -1352,9 +1278,7 @@ def analyze_hyperprotobench(base_path: str,
             print(f"  Found {len(messages_used)} messages: {', '.join(sorted(messages_used))}")
             
             # Now analyze only those messages
-            analyzer = ProtobufAnalyzer(str(proto_file),
-                                        messages_to_analyze=list(messages_used),
-                                        workload_profile=workload_profile)
+            analyzer = ProtobufAnalyzer(str(proto_file), messages_to_analyze=list(messages_used))
             print(f"  Initialized ProtobufAnalyzer for {bench_dir.name}")
             analysis = analyzer.analyze()
             
@@ -1412,8 +1336,7 @@ def analyze_hyperprotobench(base_path: str,
                 if msg_obj:
                     # Calculate actual serialized size and nested message sizes
                     size, nested_sizes = calculate_serialized_size_from_set_function(
-                        msg_name, function_body, msg_obj, all_messages_map,
-                        workload_profile=workload_profile,
+                        msg_name, function_body, msg_obj, all_messages_map
                     )
                     message_sizes[msg_name] = size
                     # Add nested message sizes to the dictionary
@@ -1639,49 +1562,8 @@ def main():
         action='store_true',
         help='Print summary to console'
     )
-    parser.add_argument(
-        '--verilator-bench-profile',
-        action='store_true',
-        help='Apply the Verilator bench workload caps (skip repeated, '
-             'max_string_len=1024, max_nested_depth=5) so the features match '
-             'what the bare-metal HPB benches under sims/verilator measure. '
-             'See WorkloadProfile.verilator_bench_default().'
-    )
-    parser.add_argument(
-        '--max-string-len',
-        type=int,
-        default=None,
-        help='Cap per-field string/bytes payload length (bytes). Overrides '
-             '--verilator-bench-profile for this single knob.'
-    )
-    parser.add_argument(
-        '--max-nested-depth',
-        type=int,
-        default=None,
-        help='Messages at nesting depth >= this contribute zero to the '
-             'serialized size. Overrides --verilator-bench-profile for this '
-             'single knob.'
-    )
-    parser.add_argument(
-        '--skip-repeated',
-        action='store_true',
-        help='Treat repeated fields as absent (zero size). Overrides '
-             '--verilator-bench-profile for this single knob.'
-    )
-
+    
     args = parser.parse_args()
-
-    # Build the workload profile.
-    if args.verilator_bench_profile:
-        profile = WorkloadProfile.verilator_bench_default()
-    else:
-        profile = WorkloadProfile()
-    if args.max_string_len is not None:
-        profile.max_string_len = args.max_string_len
-    if args.max_nested_depth is not None:
-        profile.max_nested_depth = args.max_nested_depth
-    if args.skip_repeated:
-        profile.skip_repeated = True
     
     script_dir = Path(__file__).parent
     # Resolve path - can be absolute or relative to script location
@@ -1699,11 +1581,7 @@ def main():
     
     # Analyze all benchmarks
     start_time = time.time()
-    print(f"Workload profile: max_string_len={profile.max_string_len} "
-          f"max_nested_depth={profile.max_nested_depth} "
-          f"skip_repeated={profile.skip_repeated}")
-    results = analyze_hyperprotobench(str(hyperprotobench_path),
-                                       workload_profile=profile)
+    results = analyze_hyperprotobench(str(hyperprotobench_path))
     end_time = time.time()
     print(f"Analysis complete in {end_time - start_time} seconds")
     
