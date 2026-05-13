@@ -36,13 +36,15 @@ def plot_losses(
     output_path: Path,
 ) -> None:
     """Generate and save a loss plot."""
-    plt.figure(figsize=(8, 5))
+    plt.figure(figsize=(10, 6))
     plt.plot(epochs, train_losses, label="Train loss", marker="o")
     plt.plot(epochs, eval_losses, label="Eval loss", marker="o")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title(title)
-    plt.legend()
+    plt.xlabel("Epoch", fontsize=20)
+    plt.xticks(fontsize=18)
+    plt.ylabel("Loss", fontsize=20)
+    plt.yticks(fontsize=18)
+    plt.title(title, fontsize=24)
+    plt.legend(fontsize=18)
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.tight_layout()
     plt.savefig(output_path)

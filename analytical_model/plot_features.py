@@ -113,15 +113,15 @@ def plot_distribution_feature(
         ax.plot(x, distribution, marker='o', label=benchmark_name, linewidth=2, markersize=6)
     
     # Customize plot
-    ax.set_xlabel(xlabel, fontsize=18)
-    ax.set_ylabel('Frequency / Count', fontsize=18)
-    ax.set_title(f'{feature_name.replace("_", " ").title()}', fontsize=20, fontweight='bold')
-    ax.legend(loc='upper right', fontsize=16)
+    ax.set_xlabel(xlabel, fontsize=24)
+    ax.set_ylabel('Frequency / Count', fontsize=24)
+    ax.set_title(f'{feature_name.replace("_", " ").title()}', fontsize=28, fontweight='bold')
+    ax.legend(loc='upper right', fontsize=22)
     ax.grid(True, alpha=0.3)
     
     # Increase tick mark font sizes
-    ax.tick_params(axis='both', which='major', labelsize=16)
-    ax.tick_params(axis='both', which='minor', labelsize=14)
+    ax.tick_params(axis='both', which='major', labelsize=22)
+    ax.tick_params(axis='both', which='minor', labelsize=22)
     
     # Adjust layout
     plt.tight_layout()
