@@ -114,7 +114,10 @@ def plot_distribution_feature(
     
     # Customize plot
     ax.set_xlabel(xlabel, fontsize=24)
-    ax.set_ylabel('Frequency / Count', fontsize=24)
+    if feature_name == "depth_counter_list":
+        ax.set_ylabel('Count', fontsize=24)
+    else:
+        ax.set_ylabel('Frequency', fontsize=24)
     ax.set_title(f'{feature_name.replace("_", " ").title()}', fontsize=28, fontweight='bold')
     ax.legend(loc='upper right', fontsize=22)
     ax.grid(True, alpha=0.3)
