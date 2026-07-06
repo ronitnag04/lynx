@@ -4,6 +4,9 @@
 # Ignore PyCache files
 *__pycache__*
 
+# Ignore CSV files
+*.csv
+
 # Ignore Numpy data files
 *.npy
 

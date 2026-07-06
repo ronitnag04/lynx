@@ -23,11 +23,14 @@ import numpy as np
 
 from util import (
     DEFAULT_CONFIG_BY_SIDE,
+    DEFAULT_KAPPA,
     DES_PARAM_COLUMNS,
     PARAM_VALUES_BY_SIDE,
     SER_PARAM_COLUMNS,
     SIDE_TO_NAME,
     hardware_cost,
+    hardware_cost_2vec,
+    use_trained_model,
 )
 
 
@@ -186,9 +189,16 @@ def evaluate_indices(
     builder: FeatureBuilder,
     device: str,
     batch_size: int,
+    *,
+    num_objectives: int = 3,
+    kappa: float = DEFAULT_KAPPA,
 ) -> np.ndarray:
+    """Objective columns:
+       * ``num_objectives=3`` -> ``[-throughput, logic_cells, ram_bits]``.
+       * ``num_objectives=2`` -> ``[-throughput, logic_cells + kappa*ram_bits]``.
+    """
     if indices.shape[0] == 0:
-        return np.empty((0, 2), dtype=np.float64)
+        return np.empty((0, num_objectives), dtype=np.float64)
     feats = builder.transform(indices)
     preds = np.empty(indices.shape[0] * builder.n_benchmarks, dtype=np.float32)
     with torch.no_grad():
@@ -198,9 +208,14 @@ def evaluate_indices(
             y = model(x).squeeze(-1).detach().cpu().numpy()
             preds[i:j] = y
     mean_tp = preds.reshape(indices.shape[0], builder.n_benchmarks).mean(axis=1).astype(np.float64)
-    costs = hardware_cost(builder.space.decode_indices(indices), side=side)
-    # Objective 0: minimize (-throughput) to maximize throughput.
-    return np.stack([-mean_tp, costs], axis=1)
+    cfgs = builder.space.decode_indices(indices)
+    if num_objectives == 3:
+        two_vec = hardware_cost_2vec(cfgs, side=side)
+        return np.stack([-mean_tp, two_vec[:, 0], two_vec[:, 1]], axis=1)
+    if num_objectives == 2:
+        costs = hardware_cost(cfgs, side=side, kappa=kappa)
+        return np.stack([-mean_tp, costs], axis=1)
+    raise ValueError(f"num_objectives must be 2 or 3, got {num_objectives}")
 
 
 def evaluate_all_indices(
@@ -211,49 +226,63 @@ def evaluate_all_indices(
     device: str,
     inference_batch_size: int,
     cfg_chunk_size: int,
+    *,
+    num_objectives: int = 3,
+    kappa: float = DEFAULT_KAPPA,
 ) -> np.ndarray:
     if all_idx.shape[0] == 0:
-        return np.empty((0, 2), dtype=np.float64)
+        return np.empty((0, num_objectives), dtype=np.float64)
 
-    f = np.empty((all_idx.shape[0], 2), dtype=np.float64)
+    f = np.empty((all_idx.shape[0], num_objectives), dtype=np.float64)
     for i in range(0, all_idx.shape[0], cfg_chunk_size):
         j = min(i + cfg_chunk_size, all_idx.shape[0])
         f[i:j] = evaluate_indices(
-            all_idx[i:j], side, model, builder, device, inference_batch_size
+            all_idx[i:j], side, model, builder, device, inference_batch_size,
+            num_objectives=num_objectives, kappa=kappa,
         )
     return f
 
 
 def flag_validation_candidates(pareto_f: np.ndarray, k: int) -> np.ndarray:
+    """Flag extreme + evenly-spaced Pareto points; handles ``n_obj`` in {2, 3}."""
     n = len(pareto_f)
     flags = np.zeros(n, dtype=bool)
     if n == 0:
         return flags
-    flags[int(np.argmin(pareto_f[:, 0]))] = True  # throughput optimum (max tp)
-    flags[int(np.argmin(pareto_f[:, 1]))] = True  # cost optimum
-    n_extra = max(0, k - 2)
+    n_obj = pareto_f.shape[1]
+    flags[int(np.argmin(pareto_f[:, 0]))] = True
+    for c in range(1, n_obj):
+        flags[int(np.argmin(pareto_f[:, c]))] = True
+
+    n_flagged = int(flags.sum())
+    n_extra = max(0, k - n_flagged)
     if n_extra > 0 and n >= 2:
-        order = np.argsort(pareto_f[:, 1])
+        cost_score = np.sqrt(np.sum(pareto_f[:, 1:] ** 2, axis=1))
+        order = np.argsort(cost_score)
         pos = np.linspace(0, n - 1, n_extra + 2)[1:-1].astype(int)
         for p in pos:
             flags[int(order[p])] = True
     return flags
 
 
-def strict_pareto_front_2d_min(f: np.ndarray) -> np.ndarray:
-    """Strict nondominated set for 2D minimization.
-
-    Returns indices (into f) of the nondominated points.
-    """
+def strict_pareto_front(f: np.ndarray) -> np.ndarray:
+    """Strict non-dominated set for k-D minimization. Returns indices."""
     if f.shape[0] == 0:
         return np.empty((0,), dtype=np.int64)
+    if f.shape[1] == 2:
+        return _strict_pareto_front_2d_min(f)
+    # General nd fallback using pymoo's NDS (already imported by the optimizer).
+    from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
+    front = NonDominatedSorting().do(f, only_non_dominated_front=True)
+    return np.asarray(front, dtype=np.int64)
 
-    # Sort by (f0 asc, f1 asc). Using stable sort helps keep equal keys contiguous.
+
+def _strict_pareto_front_2d_min(f: np.ndarray) -> np.ndarray:
     idx = np.lexsort((f[:, 1], f[:, 0]))
     f_sorted = f[idx]
 
     keep_sorted_pos = np.zeros(f_sorted.shape[0], dtype=bool)
-    best_f1 = np.inf  # best (minimum) f1 among *previous* f0 groups
+    best_f1 = np.inf
 
     start = 0
     n = f_sorted.shape[0]
@@ -263,10 +292,8 @@ def strict_pareto_front_2d_min(f: np.ndarray) -> np.ndarray:
         while end < n and f_sorted[end, 0] == f0_val:
             end += 1
 
-        # f1 is also sorted ascending within the group; the minimum is at 'start'.
         group_min_f1 = float(f_sorted[start, 1])
         if group_min_f1 < best_f1:
-            # Keep all points in this f0-group that achieve the min f1.
             m = start + 1
             while m < end and float(f_sorted[m, 1]) == group_min_f1:
                 m += 1
@@ -281,12 +308,11 @@ def strict_pareto_front_2d_min(f: np.ndarray) -> np.ndarray:
 def final_pareto(archive_x: np.ndarray, archive_f: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if archive_x.shape[0] == 0:
         return archive_x, archive_f
-    # Ensure unique configurations first (matches optimizer behavior).
     _, keep = np.unique(archive_x, axis=0, return_index=True)
     keep.sort()
     x = archive_x[keep]
     f = archive_f[keep]
-    pareto_idx = strict_pareto_front_2d_min(f)
+    pareto_idx = strict_pareto_front(f)
     return x[pareto_idx], f[pareto_idx]
 
 
@@ -294,17 +320,15 @@ def compute_sensitivity(
     pareto_X: np.ndarray,
     pareto_F: np.ndarray,
     space: SearchSpace,
-    side: str,
-    model: Any,
-    builder: FeatureBuilder,
-    device: str,
-    batch_size: int,
+    eval_fn: Any,
 ) -> list[dict[str, dict[str, float]]]:
-    """Per Pareto point, for each parameter, try index ±1 and report worst |Δ|."""
+    """Per Pareto point, for each parameter, try index ±1 and report worst |Δ|
+    across every objective column."""
     if pareto_X.size == 0:
         return []
 
     n_params = len(space.search_param_order)
+    n_obj = pareto_F.shape[1]
     perturb_rows: list[np.ndarray] = []
     meta: list[tuple[int, int]] = []
     for i in range(len(pareto_X)):
@@ -322,27 +346,33 @@ def compute_sensitivity(
         return [{} for _ in range(len(pareto_X))]
 
     perturb_X = np.stack(perturb_rows, axis=0)
-    F_pert = evaluate_indices(perturb_X, side, model, builder, device, batch_size)
+    F_pert = eval_fn(perturb_X)
 
     buckets: list[dict[str, dict[str, list[float]]]] = [
-        {p: {"dtp": [], "dcost": []} for p in space.search_param_order}
+        {p: {f"dobj{k}": [] for k in range(n_obj)} for p in space.search_param_order}
         for _ in range(len(pareto_X))
     ]
     for k, (i, j) in enumerate(meta):
         param = space.search_param_order[j]
-        d_obj0 = float(F_pert[k, 0] - pareto_F[i, 0])
-        d_obj1 = float(F_pert[k, 1] - pareto_F[i, 1])
-        buckets[i][param]["dtp"].append(-d_obj0)
-        buckets[i][param]["dcost"].append(d_obj1)
+        for obj_idx in range(n_obj):
+            d = float(F_pert[k, obj_idx] - pareto_F[i, obj_idx])
+            buckets[i][param][f"dobj{obj_idx}"].append(d)
 
+    obj_labels_by_ncol = {
+        2: ("max_abs_dthroughput", "max_abs_dcost"),
+        3: ("max_abs_dthroughput", "max_abs_dlogic_cells", "max_abs_dram_bits"),
+    }
+    labels = obj_labels_by_ncol.get(n_obj) or tuple(
+        f"max_abs_dobj{k}" for k in range(n_obj)
+    )
     reduced: list[dict[str, dict[str, float]]] = []
     for b in buckets:
         entry: dict[str, dict[str, float]] = {}
         for p, d in b.items():
-            if d["dtp"]:
+            if d["dobj0"]:
                 entry[p] = {
-                    "max_abs_dthroughput": float(np.max(np.abs(d["dtp"]))),
-                    "max_abs_dcost": float(np.max(np.abs(d["dcost"]))),
+                    labels[k]: float(np.max(np.abs(d[f"dobj{k}"])))
+                    for k in range(n_obj)
                 }
         reduced.append(entry)
     return reduced
@@ -387,6 +417,32 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--seed", type=int, default=42, help="Seed used only for reproducible debug limiting.")
     p.add_argument("--device", type=str, default="cpu", help="Torch device.")
+    p.add_argument(
+        "--hw-cost-model",
+        type=Path,
+        default=None,
+        help=(
+            "Optional path to a trained TrainedCostModel joblib file "
+            "(produced by hw_cost_model/fit_from_yosys.py). When omitted, "
+            "the structural RTL-derived cost estimator is used."
+        ),
+    )
+    p.add_argument(
+        "--num-objectives",
+        type=int,
+        choices=(2, 3),
+        default=3,
+        help=(
+            "3 -> Pareto over (throughput, logic_cells, ram_bits) [default]. "
+            "2 -> Pareto over (throughput, logic_cells + kappa * ram_bits)."
+        ),
+    )
+    p.add_argument(
+        "--kappa",
+        type=float,
+        default=DEFAULT_KAPPA,
+        help=f"Cost-combining weight used only when --num-objectives=2. Default {DEFAULT_KAPPA}.",
+    )
     return p.parse_args()
 
 
@@ -394,6 +450,10 @@ def main() -> None:
     args = parse_args()
     rng = np.random.default_rng(args.seed)
     t_total = time.perf_counter()
+
+    if args.hw_cost_model is not None:
+        use_trained_model(args.side, args.hw_cost_model)
+        print(f"[cost] using trained hw-cost model: {args.hw_cost_model}")
 
     side_name = SIDE_TO_NAME[args.side]
     ckpt = args.checkpoint_dir / f"{side_name}_checkpoint.pt"
@@ -409,17 +469,30 @@ def main() -> None:
     builder = FeatureBuilder(args.side, scaler, space, benches)
     model = load_model(ckpt, input_size=builder.n_features, device=args.device)
 
+    def eval_fn(xi: np.ndarray) -> np.ndarray:
+        return evaluate_indices(
+            xi, args.side, model, builder, args.device, args.batch_size,
+            num_objectives=args.num_objectives, kappa=args.kappa,
+        )
+
+    def cost_summary(F_row: np.ndarray) -> dict[str, float]:
+        if args.num_objectives == 3:
+            return {
+                "predicted_logic_cells": float(F_row[1]),
+                "predicted_ram_bits":    float(F_row[2]),
+                "predicted_cost_scalar_kappa": float(F_row[1] + args.kappa * F_row[2]),
+            }
+        return {"predicted_cost": float(F_row[1])}
+
     baseline_cfg = default_config(args.side)
     t0 = time.perf_counter()
     baseline_idx = space.encode_cfg(baseline_cfg).reshape(1, -1)
-    baseline_F = evaluate_indices(
-        baseline_idx, args.side, model, builder, args.device, args.batch_size
-    )[0]
+    baseline_F = eval_fn(baseline_idx)[0]
     baseline_tp = float(-baseline_F[0])
-    baseline_cost = float(baseline_F[1])
+    baseline_costs = cost_summary(baseline_F)
     print(
         f"Baseline (DEFAULT_CONFIG): predicted_throughput={baseline_tp:.4f} Gbit/s, "
-        f"cost={baseline_cost:.2f} ({time.perf_counter() - t0:.2f}s)"
+        f"cost={baseline_costs} ({time.perf_counter() - t0:.2f}s)"
     )
 
     t_enum = time.perf_counter()
@@ -446,6 +519,8 @@ def main() -> None:
         args.device,
         args.batch_size,
         args.cfg_chunk_size,
+        num_objectives=args.num_objectives,
+        kappa=args.kappa,
     )
     print(f"Evaluated {len(all_idx)} configs ({time.perf_counter() - t_eval:.2f}s)")
 
@@ -460,9 +535,7 @@ def main() -> None:
     else:
         t_s = time.perf_counter()
         print("Computing per-parameter sensitivity")
-        sensitivities = compute_sensitivity(
-            pareto_x, pareto_f, space, args.side, model, builder, args.device, args.batch_size
-        )
+        sensitivities = compute_sensitivity(pareto_x, pareto_f, space, eval_fn)
         print(f"Sensitivity computed in {time.perf_counter() - t_s:.2f}s")
 
     flags = flag_validation_candidates(pareto_f, args.validation_k)
@@ -471,24 +544,27 @@ def main() -> None:
 
     front: list[dict[str, object]] = []
     for i, cfg in enumerate(cfgs):
-        front.append(
-            {
-                "predicted_throughput_gbits_per_sec": float(-pareto_f[i, 0]),
-                "predicted_cost": float(pareto_f[i, 1]),
-                "validation_candidate": bool(flags[i]),
-                "sensitivity": sensitivities[i] if i < len(sensitivities) else {},
-                "config": cfg,
-            }
-        )
+        entry: dict[str, object] = {
+            "predicted_throughput_gbits_per_sec": float(-pareto_f[i, 0]),
+            "validation_candidate": bool(flags[i]),
+            "sensitivity": sensitivities[i] if i < len(sensitivities) else {},
+            "config": cfg,
+        }
+        entry.update(cost_summary(pareto_f[i]))
+        front.append(entry)
+
+    baseline_out: dict[str, object] = {
+        "predicted_throughput_gbits_per_sec": baseline_tp,
+        "config": baseline_cfg,
+    }
+    baseline_out.update(baseline_costs)
 
     out = {
         "side": args.side,
+        "num_objectives": args.num_objectives,
+        "kappa": args.kappa if args.num_objectives == 2 else None,
         "benchmark_count": len(benches),
-        "baseline": {
-            "predicted_throughput_gbits_per_sec": baseline_tp,
-            "predicted_cost": baseline_cost,
-            "config": baseline_cfg,
-        },
+        "baseline": baseline_out,
         "pareto_front": front,
         "stats": {
             "search": "exhaustive",
