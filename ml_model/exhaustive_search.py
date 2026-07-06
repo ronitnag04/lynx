@@ -63,14 +63,20 @@ def load_benchmark_feature_rows(features_path: Path) -> list[dict[str, float]]:
     return rows
 
 
-def load_model(checkpoint_path: Path, input_size: int, device: str) -> Any:
-    ck = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    # Keep architecture identical to training/optimizer.
-    model = LynxMLModel(input_size=input_size, hidden_dims=[256, 128], output_size=1)
-    model.load_state_dict(ck["state_dict"])
-    model.to(device)
-    model.eval()
-    return model
+def load_model(checkpoint_path: Path, input_size: int, device: str, model_type: str = "neural") -> Any:
+    """Load a trained model - either neural network or sklearn model."""
+    if model_type == "neural":
+        ck = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        # Keep architecture identical to training/optimizer.
+        model = LynxMLModel(input_size=input_size, hidden_dims=[256, 128], output_size=1)
+        model.load_state_dict(ck["state_dict"])
+        model.to(device)
+        model.eval()
+        return model
+    else:
+        # Load sklearn model
+        model = joblib.load(checkpoint_path)
+        return model
 
 
 def cartesian_product_indices(sizes: np.ndarray) -> np.ndarray:
@@ -192,6 +198,7 @@ def evaluate_indices(
     *,
     num_objectives: int = 3,
     kappa: float = DEFAULT_KAPPA,
+    model_type: str = "neural",
 ) -> np.ndarray:
     """Objective columns:
        * ``num_objectives=3`` -> ``[-throughput, logic_cells, ram_bits]``.
@@ -201,12 +208,21 @@ def evaluate_indices(
         return np.empty((0, num_objectives), dtype=np.float64)
     feats = builder.transform(indices)
     preds = np.empty(indices.shape[0] * builder.n_benchmarks, dtype=np.float32)
-    with torch.no_grad():
+
+    if model_type == "neural":
+        with torch.no_grad():
+            for i in range(0, feats.shape[0], batch_size):
+                j = min(i + batch_size, feats.shape[0])
+                x = torch.from_numpy(feats[i:j]).to(device)
+                y = model(x).squeeze(-1).detach().cpu().numpy()
+                preds[i:j] = y
+    else:
+        # Sklearn model
         for i in range(0, feats.shape[0], batch_size):
             j = min(i + batch_size, feats.shape[0])
-            x = torch.from_numpy(feats[i:j]).to(device)
-            y = model(x).squeeze(-1).detach().cpu().numpy()
+            y = model.predict(feats[i:j])
             preds[i:j] = y
+
     mean_tp = preds.reshape(indices.shape[0], builder.n_benchmarks).mean(axis=1).astype(np.float64)
     cfgs = builder.space.decode_indices(indices)
     if num_objectives == 3:
@@ -229,6 +245,7 @@ def evaluate_all_indices(
     *,
     num_objectives: int = 3,
     kappa: float = DEFAULT_KAPPA,
+    model_type: str = "neural",
 ) -> np.ndarray:
     if all_idx.shape[0] == 0:
         return np.empty((0, num_objectives), dtype=np.float64)
@@ -238,7 +255,7 @@ def evaluate_all_indices(
         j = min(i + cfg_chunk_size, all_idx.shape[0])
         f[i:j] = evaluate_indices(
             all_idx[i:j], side, model, builder, device, inference_batch_size,
-            num_objectives=num_objectives, kappa=kappa,
+            num_objectives=num_objectives, kappa=kappa, model_type=model_type,
         )
     return f
 
@@ -443,6 +460,28 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_KAPPA,
         help=f"Cost-combining weight used only when --num-objectives=2. Default {DEFAULT_KAPPA}.",
     )
+    p.add_argument(
+        "--model-type",
+        type=str,
+        choices=[
+            "neural",
+            "LinearRegression",
+            "Ridge",
+            "Lasso",
+            "ElasticNet",
+            "DecisionTree",
+            "RandomForest",
+            "GradientBoosting",
+            "KNN",
+            "SVR",
+        ],
+        default="neural",
+        help=(
+            "Type of model to use for throughput prediction. "
+            "'neural' uses the neural network checkpoint. "
+            "Other options use sklearn models saved by train_all_models.py."
+        ),
+    )
     return p.parse_args()
 
 
@@ -456,8 +495,15 @@ def main() -> None:
         print(f"[cost] using trained hw-cost model: {args.hw_cost_model}")
 
     side_name = SIDE_TO_NAME[args.side]
-    ckpt = args.checkpoint_dir / f"{side_name}_checkpoint.pt"
+
+    # Determine checkpoint path based on model type
+    if args.model_type == "neural":
+        ckpt = args.checkpoint_dir / f"{side_name}_checkpoint.pt"
+    else:
+        ckpt = args.checkpoint_dir / f"{side_name}_{args.model_type}_model.joblib"
+
     scl = args.checkpoint_dir / f"{side_name}_scaler.joblib"
+
     if not ckpt.is_file() or not scl.is_file():
         raise FileNotFoundError(f"Missing checkpoint/scaler in {args.checkpoint_dir}")
 
@@ -467,12 +513,12 @@ def main() -> None:
     scaler = joblib.load(scl)
     benches = load_benchmark_feature_rows(args.features_file)
     builder = FeatureBuilder(args.side, scaler, space, benches)
-    model = load_model(ckpt, input_size=builder.n_features, device=args.device)
+    model = load_model(ckpt, input_size=builder.n_features, device=args.device, model_type=args.model_type)
 
     def eval_fn(xi: np.ndarray) -> np.ndarray:
         return evaluate_indices(
             xi, args.side, model, builder, args.device, args.batch_size,
-            num_objectives=args.num_objectives, kappa=args.kappa,
+            num_objectives=args.num_objectives, kappa=args.kappa, model_type=args.model_type,
         )
 
     def cost_summary(F_row: np.ndarray) -> dict[str, float]:
@@ -521,6 +567,7 @@ def main() -> None:
         args.cfg_chunk_size,
         num_objectives=args.num_objectives,
         kappa=args.kappa,
+        model_type=args.model_type,
     )
     print(f"Evaluated {len(all_idx)} configs ({time.perf_counter() - t_eval:.2f}s)")
 
@@ -561,6 +608,7 @@ def main() -> None:
 
     out = {
         "side": args.side,
+        "model_type": args.model_type,
         "num_objectives": args.num_objectives,
         "kappa": args.kappa if args.num_objectives == 2 else None,
         "benchmark_count": len(benches),
