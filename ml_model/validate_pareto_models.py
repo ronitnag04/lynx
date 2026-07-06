@@ -38,13 +38,18 @@ def load_validation_data(yosys_file: Path, sweep_file: Path) -> Tuple[pd.DataFra
     sweep_df = pd.read_csv(sweep_file)
     return yosys_df, sweep_df
 
-def get_actual_cost(config_name: str, yosys_df: pd.DataFrame) -> float:
-    """Get actual hardware cost for a config from yosys results."""
+def get_actual_cost(config_name: str, yosys_df: pd.DataFrame, kappa: float) -> float:
+    """Get actual hardware cost for a config from yosys results.
+
+    Must match the cost metric the model predicts: the pareto search /
+    hw_cost_model define scalar cost as ``logic_cells + kappa * ram_bits``
+    (see hw_cost_model.predict_scalar). kappa is read per-JSON so the
+    comparison is apples-to-apples.
+    """
     row = yosys_df[yosys_df['config_name'] == config_name]
     if row.empty:
         return None
-    # Cost = total_logic_cells + total_ram_flop_cells
-    return float(row['total_logic_cells'].iloc[0] + row['total_ram_flop_cells'].iloc[0])
+    return float(row['total_logic_cells'].iloc[0] + kappa * row['total_ram_bits'].iloc[0])
 
 def get_actual_throughput(config_name: str, sweep_df: pd.DataFrame) -> float:
     """Get actual average throughput for a config from benchmark sweep results."""
@@ -105,6 +110,7 @@ def plot_pareto_front(pareto_data: Dict, yosys_df: pd.DataFrame, sweep_df: pd.Da
     """Plot pareto front with predicted vs actual points."""
     side = pareto_data['side']
     pareto_points = pareto_data['pareto_front']
+    kappa = pareto_data.get('kappa', 0.0001)
 
     # Extract predicted values
     predicted_costs = []
@@ -123,7 +129,7 @@ def plot_pareto_front(pareto_data: Dict, yosys_df: pd.DataFrame, sweep_df: pd.Da
         if point.get('validation_candidate', False):
             config_name = config_to_name(point['config'], side)
             config_names.append(config_name)
-            actual_cost = get_actual_cost(config_name, yosys_df)
+            actual_cost = get_actual_cost(config_name, yosys_df, kappa)
             actual_tput = get_actual_throughput(config_name, sweep_df)
             actual_costs.append(actual_cost)
             actual_throughputs.append(actual_tput)
@@ -158,7 +164,7 @@ def plot_pareto_front(pareto_data: Dict, yosys_df: pd.DataFrame, sweep_df: pd.Da
         ax.scatter(baseline['predicted_cost'], baseline['predicted_throughput_gbits_per_sec'],
                    c="purple", marker='D', s=100, label="Baseline", alpha=0.9)
 
-    ax.set_xlabel("Hardware Cost (logic cells + RAM flop cells)", fontsize=14)
+    ax.set_xlabel(f"Hardware Cost (logic_cells + {kappa:g}·ram_bits)", fontsize=14)
     ax.set_ylabel("Throughput (Gbit/s)", fontsize=14)
     ax.set_title(f"{side.upper()} {model_name}: Pareto Front (Predicted vs Actual)", fontsize=16)
     plt.yticks(fontsize=12)
@@ -187,8 +193,11 @@ def plot_pareto_front(pareto_data: Dict, yosys_df: pd.DataFrame, sweep_df: pd.Da
             x_pos = np.arange(len(valid_indices))
             width = 0.35
 
-            ax1.bar(x_pos - width/2, pred_costs_val, width, label='Predicted', alpha=0.8, color='red')
-            ax1.bar(x_pos + width/2, actual_costs_val, width, label='Actual', alpha=0.8, color='green')
+            b1p = ax1.bar(x_pos - width/2, pred_costs_val, width, label='Predicted', alpha=0.8, color='red')
+            b1a = ax1.bar(x_pos + width/2, actual_costs_val, width, label='Actual', alpha=0.8, color='green')
+            ax1.bar_label(b1p, fmt='%.0f', fontsize=7, rotation=90, padding=2)
+            ax1.bar_label(b1a, fmt='%.0f', fontsize=7, rotation=90, padding=2)
+            ax1.margins(y=0.15)  # headroom for rotated labels
             ax1.set_xlabel("Validation Config Index", fontsize=12)
             ax1.set_ylabel("Hardware Cost", fontsize=12)
             ax1.set_title(f"{model_name}: Cost Comparison", fontsize=14)
@@ -196,8 +205,11 @@ def plot_pareto_front(pareto_data: Dict, yosys_df: pd.DataFrame, sweep_df: pd.Da
             ax1.grid(True, alpha=0.3, axis='y')
 
             # Throughput comparison
-            ax2.bar(x_pos - width/2, pred_tput_val, width, label='Predicted', alpha=0.8, color='red')
-            ax2.bar(x_pos + width/2, actual_tput_val, width, label='Actual', alpha=0.8, color='green')
+            b2p = ax2.bar(x_pos - width/2, pred_tput_val, width, label='Predicted', alpha=0.8, color='red')
+            b2a = ax2.bar(x_pos + width/2, actual_tput_val, width, label='Actual', alpha=0.8, color='green')
+            ax2.bar_label(b2p, fmt='%.3f', fontsize=7, rotation=90, padding=2)
+            ax2.bar_label(b2a, fmt='%.3f', fontsize=7, rotation=90, padding=2)
+            ax2.margins(y=0.15)
             ax2.set_xlabel("Validation Config Index", fontsize=12)
             ax2.set_ylabel("Throughput (Gbit/s)", fontsize=12)
             ax2.set_title(f"{model_name}: Throughput Comparison", fontsize=14)
@@ -212,6 +224,7 @@ def calculate_errors(pareto_data: Dict, yosys_df: pd.DataFrame, sweep_df: pd.Dat
     """Calculate percent errors for validation configs."""
     side = pareto_data['side']
     pareto_points = pareto_data['pareto_front']
+    kappa = pareto_data.get('kappa', 0.0001)
 
     results = []
 
@@ -223,7 +236,7 @@ def calculate_errors(pareto_data: Dict, yosys_df: pd.DataFrame, sweep_df: pd.Dat
         predicted_cost = point['predicted_cost']
         predicted_tput = point['predicted_throughput_gbits_per_sec']
 
-        actual_cost = get_actual_cost(config_name, yosys_df)
+        actual_cost = get_actual_cost(config_name, yosys_df, kappa)
         actual_tput = get_actual_throughput(config_name, sweep_df)
 
         if actual_cost is not None and actual_tput is not None:
@@ -305,7 +318,83 @@ def process_side(side: str, base_dir: Path, output_base: Path):
         else:
             print(f"    ⚠ No validation data found")
 
+    # Write detailed per-side stats to a text file.
+    stats_file = comparison_dir / f"{side}_validation_stats.txt"
+    write_stats_text(side, all_errors, stats_file)
+    print(f"\n  Wrote stats: {stats_file}")
+
     return all_errors, plot_dir
+
+
+def _err_stats(errs: np.ndarray) -> Dict[str, float]:
+    """Signed-error summary stats (errs are percent values)."""
+    abs_errs = np.abs(errs)
+    return {
+        "mae": float(np.mean(abs_errs)),
+        "mean": float(np.mean(errs)),
+        "median": float(np.median(errs)),
+        "min": float(np.min(errs)),
+        "max": float(np.max(errs)),
+        "max_abs": float(np.max(abs_errs)),
+        "rmse": float(np.sqrt(np.mean(errs ** 2))),
+    }
+
+
+def write_stats_text(side: str, all_errors: List[Dict], out_file: Path):
+    """Write exact per-config numbers and accuracy stats to a text file."""
+    side_name = "Serializer" if side == "ser" else "Deserializer"
+    with open(out_file, "w") as f:
+        f.write("=" * 100 + "\n")
+        f.write(f"{side_name} ({side}) — Validation Accuracy Stats\n")
+        f.write("Cost metric: logic_cells + kappa*ram_bits (kappa read per-model JSON)\n")
+        f.write("Error % = (predicted - actual) / actual * 100\n")
+        f.write("=" * 100 + "\n\n")
+
+        for model_info in all_errors:
+            model_name = model_info["Model"]
+            edf = model_info["error_df"]
+            f.write("-" * 100 + "\n")
+            f.write(f"MODEL: {model_name}   (validation configs: {len(edf)})\n")
+            f.write("-" * 100 + "\n")
+
+            # Per-config table
+            hdr = (f"{'Config':<62s} {'Pred Cost':>12s} {'Act Cost':>12s} "
+                   f"{'Cost%':>8s} {'Pred TP':>9s} {'Act TP':>9s} {'TP%':>8s}\n")
+            f.write(hdr)
+            for _, r in edf.iterrows():
+                f.write(
+                    f"{r['Config']:<62s} {float(r['Predicted Cost']):>12.2f} "
+                    f"{float(r['Actual Cost']):>12.2f} {r['cost_error_float']:>+8.3f} "
+                    f"{float(r['Predicted Throughput (Gbit/s)']):>9.3f} "
+                    f"{float(r['Actual Throughput (Gbit/s)']):>9.3f} "
+                    f"{r['tput_error_float']:>+8.3f}\n"
+                )
+
+            # Accuracy stats
+            cstat = _err_stats(edf["cost_error_float"].to_numpy())
+            tstat = _err_stats(edf["tput_error_float"].to_numpy())
+            f.write("\n  Cost error %:       "
+                    f"MAE={cstat['mae']:.3f}  mean={cstat['mean']:+.3f}  "
+                    f"median={cstat['median']:+.3f}  min={cstat['min']:+.3f}  "
+                    f"max={cstat['max']:+.3f}  RMSE={cstat['rmse']:.3f}\n")
+            f.write("  Throughput error %: "
+                    f"MAE={tstat['mae']:.3f}  mean={tstat['mean']:+.3f}  "
+                    f"median={tstat['median']:+.3f}  min={tstat['min']:+.3f}  "
+                    f"max={tstat['max']:+.3f}  RMSE={tstat['rmse']:.3f}\n\n")
+
+        # Per-side summary across models
+        f.write("=" * 100 + "\n")
+        f.write(f"{side_name} SUMMARY (per model)\n")
+        f.write("=" * 100 + "\n")
+        f.write(f"{'Model':<20s} {'#Cfg':>5s} {'Cost MAE%':>10s} {'Cost max|%|':>12s} "
+                f"{'TP MAE%':>9s} {'TP max|%|':>10s}\n")
+        for model_info in all_errors:
+            edf = model_info["error_df"]
+            cstat = _err_stats(edf["cost_error_float"].to_numpy())
+            tstat = _err_stats(edf["tput_error_float"].to_numpy())
+            f.write(f"{model_info['Model']:<20s} {len(edf):>5d} "
+                    f"{cstat['mae']:>10.3f} {cstat['max_abs']:>12.3f} "
+                    f"{tstat['mae']:>9.3f} {tstat['max_abs']:>10.3f}\n")
 
 def generate_markdown_report(ser_errors: List[Dict], des_errors: List[Dict], output_file: Path):
     """Generate markdown report with all error tables."""
@@ -381,6 +470,50 @@ def generate_markdown_report(ser_errors: List[Dict], des_errors: List[Dict], out
         f.write(f"**Mean Cost Error across all models:** {np.mean(all_cost_errors):.2f}%  \n")
         f.write(f"**Mean Throughput Error across all models:** {np.mean(all_tput_errors):.2f}%  \n")
 
+def write_overall_stats(ser_errors: List[Dict], des_errors: List[Dict], out_file: Path):
+    """Write a combined cross-side summary of accuracy stats."""
+    with open(out_file, "w") as f:
+        f.write("=" * 100 + "\n")
+        f.write("ML MODEL VALIDATION — OVERALL ACCURACY STATS\n")
+        f.write("Cost metric: logic_cells + kappa*ram_bits   |   "
+                "Error % = (predicted - actual) / actual * 100\n")
+        f.write("=" * 100 + "\n\n")
+
+        f.write(f"{'Side':<6s} {'Model':<20s} {'#Cfg':>5s} "
+                f"{'Cost MAE%':>10s} {'Cost mean%':>11s} {'Cost max|%|':>12s} "
+                f"{'TP MAE%':>9s} {'TP mean%':>10s} {'TP max|%|':>10s}\n")
+        f.write("-" * 100 + "\n")
+
+        all_cost, all_tput = [], []
+        for model_info in ser_errors + des_errors:
+            edf = model_info["error_df"]
+            c = edf["cost_error_float"].to_numpy()
+            t = edf["tput_error_float"].to_numpy()
+            cstat, tstat = _err_stats(c), _err_stats(t)
+            all_cost.append(c)
+            all_tput.append(t)
+            f.write(f"{model_info['Side']:<6s} {model_info['Model']:<20s} {len(edf):>5d} "
+                    f"{cstat['mae']:>10.3f} {cstat['mean']:>+11.3f} {cstat['max_abs']:>12.3f} "
+                    f"{tstat['mae']:>9.3f} {tstat['mean']:>+10.3f} {tstat['max_abs']:>10.3f}\n")
+
+        f.write("-" * 100 + "\n")
+        if all_cost:
+            cc = np.concatenate(all_cost)
+            tt = np.concatenate(all_tput)
+            f.write(f"{'ALL':<6s} {'(pooled configs)':<20s} {len(cc):>5d} "
+                    f"{np.mean(np.abs(cc)):>10.3f} {np.mean(cc):>+11.3f} {np.max(np.abs(cc)):>12.3f} "
+                    f"{np.mean(np.abs(tt)):>9.3f} {np.mean(tt):>+10.3f} {np.max(np.abs(tt)):>10.3f}\n")
+
+        # Mean-of-model-means (each model weighted equally)
+        f.write("\nMean of per-model MAE (models weighted equally):\n")
+        cost_maes = [_err_stats(m["error_df"]["cost_error_float"].to_numpy())["mae"]
+                     for m in ser_errors + des_errors]
+        tput_maes = [_err_stats(m["error_df"]["tput_error_float"].to_numpy())["mae"]
+                     for m in ser_errors + des_errors]
+        f.write(f"  Cost MAE%:       {np.mean(cost_maes):.3f}\n")
+        f.write(f"  Throughput MAE%: {np.mean(tput_maes):.3f}\n")
+
+
 def main():
     # Setup paths
     base_dir = Path("/home/ubuntu/lynx/ml_model/results/hpb_verilator")
@@ -395,6 +528,10 @@ def main():
     report_file = base_dir / "ml_model_validation_report.md"
     generate_markdown_report(ser_errors, des_errors, report_file)
 
+    # Generate combined overall stats text file
+    overall_stats_file = base_dir / "ml_model_validation_stats.txt"
+    write_overall_stats(ser_errors, des_errors, overall_stats_file)
+
     print(f"\n{'='*80}")
     print(f"✓ Validation complete!")
     print(f"{'='*80}\n")
@@ -402,6 +539,7 @@ def main():
     print(f"  - Serializer plots: {ser_plot_dir}")
     print(f"  - Deserializer plots: {des_plot_dir}")
     print(f"  - Full report: {report_file}")
+    print(f"  - Overall stats: {overall_stats_file}")
     print()
 
 if __name__ == "__main__":

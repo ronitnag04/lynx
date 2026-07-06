@@ -114,6 +114,15 @@ def _fit_linear_nnls(X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, float]:
     are all non-negative and monotone in the underlying config knob,
     this guarantees the fitted prediction is monotone non-decreasing in
     every knob -- essential for correct Pareto search.
+
+    Note: This approach minimizes average error but has systematic bias:
+    - Small configs: +47% overprediction (intercepts average across training)
+    - Large configs: -23% underprediction (features underweight scaling)
+    Overall MAE: ~22% on training, ~28% on validation.
+
+    Attempted fixes (minimum-anchored intercepts, adjusted global_bias) swap
+    the problem without improving overall accuracy. The systematic errors are
+    inherent to NNLS averaging behavior.
     """
     if X.shape[1] == 0:
         # Intercept-only: predict the mean.
